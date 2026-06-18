@@ -18,6 +18,7 @@ no cloud.
 - [Building](#building)
 - [Quick Start](#quick-start)
 - [Security Model](#security-model)
+- [Issuing Certificates as the Administrator (Master)](#issuing-certificates-as-the-administrator-master)
 - [Client Auto-Registration](#client-auto-registration)
 - [Issuing a Certificate as a Client (CSR-flow)](#issuing-a-certificate-as-a-client-csr-flow)
 - [Revocation](#revocation)
@@ -32,7 +33,7 @@ no cloud.
 
 | Category | Capabilities |
 |---|---|
-| **Master** | Bootstrap Root CA (10y), CLI-only admin issuance, mTLS CSR signing, replicated AES-GCM-256 cache, revocation |
+| **Master** | Bootstrap Root CA (10y), CLI-only admin issuance (any target), mTLS CSR signing, replicated AES-GCM-256 cache, revocation |
 | **Client** | Auto-install Root CA into OS + Firefox, auto-enroll (token + subnet), receive an **mTLS identity**, issue loopback certs for itself, ReadOnly when master is down |
 | **Transport** | Bootstrap path **pinned to the Root CA**; control plane is **mutual TLS** on `:8443` |
 | **Replication** | **Pull-only** encrypted cache with **monotonic versioning** (anti-replay/stale); no inbound push surface |
@@ -129,6 +130,7 @@ sudo natssl --mode=master --bootstrap     # writes 24 words + prints fingerprint
 #   - set enrollment_token + client_networks in /etc/natssl/config.yaml
 sudo systemctl enable --now natssl-master
 sudo natssl --mode=master --issue "app.internal"
+sudo natssl --mode=master --issue "192.168.1.2"
 
 # 3. Client
 #   set master_address, master_fingerprint, enrollment_token, recovery_public_key
@@ -176,6 +178,69 @@ Four independent controls:
 
 ---
 
+## Issuing Certificates as the Administrator (Master)
+
+The administrator can mint a certificate for **any** target directly on the
+master via the CLI. This path never traverses the network — the master
+generates both the certificate and its private key.
+
+```bash
+# Domain
+sudo natssl --mode=master --issue "app.internal"
+
+# IP address (v4 or v6)
+sudo natssl --mode=master --issue "192.168.1.2"
+
+# Wildcard
+sudo natssl --mode=master --issue "*.internal"
+```
+
+| Target type | Goes into SAN as | Example |
+|---|---|---|
+| Domain (has a dot) | `DNS:` | `app.internal`, `nas.local` |
+| IP address (v4/v6) | `IP Address:` | `192.168.1.2`, `fd00::1` |
+| Wildcard | `DNS:` | `*.internal` |
+
+**Validity:** 90 days. Re-issue with the same command to renew (a new serial is
+minted; revoke the old one with `--revoke` if needed).
+
+**Output files:**
+
+```
+/var/lib/natssl/issued/192.168.1.2.crt   # certificate (0644)
+/var/lib/natssl/issued/192.168.1.2.key   # private key  (0600)
+```
+
+The certificate is also recorded in the database and the encrypted cache is
+rebuilt automatically, so it propagates to clients on their next pull.
+
+**Verify the SAN** (browsers ignore CommonName and read only the SAN):
+
+```bash
+openssl x509 -in /var/lib/natssl/issued/192.168.1.2.crt \
+  -noout -text | grep -A1 "Alternative Name"
+# X509v3 Subject Alternative Name:
+#     IP Address:192.168.1.2
+```
+
+### Allowed targets
+
+`validIssuanceTarget` accepts:
+- any DNS name containing a dot (`app.internal`, `db.corp.lan`)
+- the suffixes `.local` and `.internal` explicitly
+- any valid IPv4 / IPv6 address
+
+Single-label names without a dot (e.g. `myhost`) are rejected unless you also
+pass `--localhost` (which forces a Same-PC-only loopback certificate).
+
+> **Why is this CLI-only?** Arbitrary-target issuance is an administrator action
+> by design. The networked `/acme/sign-csr` endpoint (over mTLS) is restricted
+> to **loopback** targets, so a compromised client cannot mint a certificate
+> impersonating another host on the shared CA. See the
+> [Security Model](#security-model).
+
+---
+
 ## Client Auto-Registration
 
 Two gates must **both** pass: a valid **enrollment token** *and* a source IP
@@ -193,7 +258,7 @@ journalctl -u natssl-master | grep AUDIT
 
 > **Hard rule:** clients may issue **only loopback** certs. Enforced locally,
 > then again on the master (HTTP 403). Domain/IP certs are an administrator
-> action on the master.
+> action on the master (see [above](#issuing-certificates-as-the-administrator-master)).
 
 ```bash
 sudo natssl --mode=client --issue "localhost" --localhost   # over mutual TLS
@@ -215,6 +280,13 @@ sudo natssl --mode=master --revoke "<serial-hex>"
 
 The revocation is recorded, the encrypted cache is rebuilt, and clients fetch
 the updated list from `/sync/crl` on their next pull.
+
+Find a certificate's serial:
+
+```bash
+openssl x509 -in /var/lib/natssl/issued/app.internal.crt -noout -serial
+# serial=0A1B2C...
+```
 
 ---
 
@@ -280,7 +352,7 @@ the signed migration packet). See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 |---|---|
 | `--mode=master --bootstrap` | Initialize Root CA + seed; print fingerprint |
 | `--mode=master` | Run master (`:443` bootstrap, `:8443` mTLS) |
-| `--mode=master --issue "X" [--localhost]` | CLI-only issuance (any target) |
+| `--mode=master --issue "X" [--localhost]` | CLI-only issuance (any domain / IP / wildcard) |
 | `--mode=master --revoke "<serial>"` | Revoke by hex serial |
 | `--mode=client` | Run client (install CA, enroll, pull) |
 | `--mode=client --issue "localhost"` | Issue a loopback cert (CSR-flow over mTLS) |

@@ -54,12 +54,19 @@ stale protection). Writes are atomic (temp + rename); bodies are size-capped.
 </details>
 
 <details>
-<summary><b>2.5 Loopback-only client issuance (point 3)</b></summary>
+<summary><b>2.5 Issuance authorization model (point 3)</b></summary>
 
-`/acme/new-order` was **removed**. Admin issuance is CLI-only (`RunIssueCLI`,
-any target) and never traverses HTTP. Client issuance is loopback-only via
-`/acme/sign-csr` over mTLS, enforced by `enforceLoopbackOnly` (server) and
-`SignCSR` (CA) — HTTP 403 otherwise.
+`/acme/new-order` was **removed**. There are two distinct issuance paths:
+
+| Path | Who | Targets | Transport |
+|---|---|---|---|
+| `RunIssueCLI` (`--issue`) | **Admin on master** | any domain / IP / wildcard | CLI only (no network) |
+| `/acme/sign-csr` | **Enrolled client** | loopback only | mTLS on `:8443` |
+
+The client path is enforced twice — `enforceLoopbackOnly` (server) and
+`SignCSR` (CA) — returning HTTP 403 for anything non-loopback. A compromised
+client therefore cannot mint a certificate impersonating another host on the
+shared CA.
 </details>
 
 ---
@@ -85,9 +92,21 @@ sudo chmod 600 /etc/natssl/config.yaml                   # token is secret
 
 ## 4. systemd
 
-`natssl-master.service` / `natssl-client.service` (unchanged from prior
-versions) need `CAP_NET_BIND_SERVICE` (bind :443) and `CAP_NET_RAW` (ICMP check
-during promotion). Enable with `systemctl enable --now`.
+`natssl-master.service` / `natssl-client.service` ship with capability scoping
+and filesystem hardening:
+
+- **Master:** `CAP_NET_BIND_SERVICE` (bind `:443`), `ProtectSystem=strict`,
+  only `/var/lib/natssl` writable.
+- **Client:** `CAP_NET_RAW` (ICMP during the promotion safety chain),
+  `ProtectSystem=full`, plus write access to the OS trust-store anchor dirs so
+  it can install the Root CA.
+
+```bash
+sudo cp natssl-*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now natssl-master   # or natssl-client
+systemd-analyze security natssl-master.service
+```
 
 ---
 
@@ -111,12 +130,60 @@ flowchart TD
 
 ## 6. Certificate Lifecycle
 
-- **Admin (any target):** `natssl --mode=master --issue "app.internal"` — CLI
-  only, master generates the key, records + rebuilds the cache.
-- **Client (loopback):** `natssl --mode=client --issue "localhost" --localhost`
-  — CSR-flow over mTLS; private key stays on the client.
-- **Revoke:** `natssl --mode=master --revoke "<serial>"` — recorded, cache
-  rebuilt, clients fetch `/sync/crl` on next pull.
+### 6.1 Administrator issuance (any target) — on the master
+
+The master generates both the certificate and its private key. CLI only.
+
+```bash
+# Domain
+sudo natssl --mode=master --issue "app.internal"
+
+# IP address (v4 or v6)
+sudo natssl --mode=master --issue "192.168.1.2"
+sudo natssl --mode=master --issue "fd00::1"
+
+# Wildcard
+sudo natssl --mode=master --issue "*.internal"
+```
+
+| Target | SAN entry | Validity |
+|---|---|---|
+| Domain with a dot | `DNS:<name>` | 90 days |
+| IPv4 / IPv6 | `IP Address:<ip>` | 90 days |
+| Wildcard | `DNS:*.<suffix>` | 90 days |
+| `--localhost` | `DNS:localhost` + loopback IPs | 1 year |
+
+Files land in `/var/lib/natssl/issued/<sanitized-target>.{crt,key}` (key `0600`),
+the record is written to the database, and the encrypted cache is rebuilt so the
+issuance propagates to clients on their next pull.
+
+```bash
+# Confirm the SAN (browsers read SAN, not CommonName):
+openssl x509 -in /var/lib/natssl/issued/192.168.1.2.crt \
+  -noout -text | grep -A1 "Alternative Name"
+```
+
+> Single-label names without a dot (`myhost`) are rejected by
+> `validIssuanceTarget` unless `--localhost` is passed.
+
+### 6.2 Client issuance (loopback only) — on the client
+
+```bash
+sudo natssl --mode=client --issue "localhost" --localhost
+natssl --mode=client --decrypt-key=/var/lib/natssl/issued/localhost.key.enc > key.pem
+```
+
+CSR-flow over mTLS; the private key is generated locally and never leaves the
+client. If the master is down, issuance is blocked (ReadOnly).
+
+### 6.3 Revoke
+
+```bash
+sudo natssl --mode=master --revoke "<serial-hex>"
+# serial: openssl x509 -in <cert>.crt -noout -serial
+```
+
+Recorded, cache rebuilt, clients fetch `/sync/crl` on next pull.
 
 ---
 
@@ -168,7 +235,7 @@ journalctl -u natssl-client | grep -i "pull\|enroll\|fingerprint\|stale"
 nc -vz <master> 443 ; nc -vz <master> 8443
 
 openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
-openssl x509 -in /var/lib/natssl/issued/localhost.crt -noout -text | grep -A2 "Alternative Name"
+openssl x509 -in /var/lib/natssl/issued/192.168.1.2.crt -noout -text | grep -A2 "Alternative Name"
 ```
 
 ---
@@ -180,6 +247,7 @@ openssl x509 -in /var/lib/natssl/issued/localhost.crt -noout -text | grep -A2 "A
 | `client_networks is set but enrollment_token is empty` | Fail-closed startup. Set a token on the master. |
 | `invalid or missing enrollment token` (403) | Token mismatch — same value on both sides. |
 | `not in any allowed client network` (403) | Widen `client_networks`. |
+| `target not allowed for issuance` | Single-label name without a dot; add a dot, use an IP, or pass `--localhost`. |
 | `master leaf does not chain to pinned Root CA` | Wrong/stale `master_fingerprint`, or a rogue master. |
 | `cannot verify master: set master_fingerprint or install the Root CA first` | Fail-closed — set the fingerprint. |
 | `clients may only request localhost ...` | Expected — use the master for domain/IP certs. |
@@ -189,6 +257,11 @@ openssl x509 -in /var/lib/natssl/issued/localhost.crt -noout -text | grep -A2 "A
 ---
 
 ## 11. FAQ
+
+**Can I issue a certificate for an IP address?** Yes — on the master:
+`natssl --mode=master --issue "192.168.1.2"`. The IP goes into the SAN as
+`IP Address:`, valid 90 days. Clients cannot do this (loopback-only); it is an
+administrator action.
 
 **Why is the Root CA never the TLS key?** A network-facing key is exposed to
 far more attack surface. The CA key only signs; a short-lived server leaf takes
