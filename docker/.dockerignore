@@ -1,0 +1,11 @@
+.git
+ansible
+docs
+dist
+*.tar.gz
+*.md
+.github
+build.sh
+pack.sh
+docker
+

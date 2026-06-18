@@ -1,0 +1,42 @@
+services:
+  natssl-master:
+    build:
+      context: ..                 # корень репо (где go.mod)
+      dockerfile: docker/Dockerfile
+      args:
+        VERSION: ${NATSSL_VERSION:-1.0.8-oss}
+    image: ${NATSSL_IMAGE:-iskyneon/natssl:1.0.8-oss}
+    container_name: natssl-master
+    command: ["--mode=master", "--config=/etc/natssl/config.yaml"]
+
+    ports:
+      - "${ACME_PORT:-443}:443"     # bootstrap / GET /ca / enroll
+      - "${MGMT_PORT:-8443}:8443"   # mTLS control plane (CSR sign, pull)
+
+    volumes:
+      # каталог целиком: bootstrap дописывает recovery_public_key (atomic rename)
+      - ./master:/etc/natssl
+      # Root CA, приватный ключ, sqlite-база
+      - natssl-master-data:/var/lib/natssl
+
+    # повторяем hardening из systemd-юнита
+    cap_drop: ["ALL"]
+    cap_add:
+      - NET_BIND_SERVICE   # bind :443
+      - NET_RAW            # ICMP/ARP safety-chain (netcheck.go)
+    security_opt:
+      - no-new-privileges:true     # = NoNewPrivileges=true
+
+    restart: unless-stopped
+
+    healthcheck:
+      # мастер отдаёт Root CA по HTTPS на :443 — простая проверка живости
+      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://127.0.0.1:443/ca"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  natssl-master-data:
+
