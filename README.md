@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.7--oss-blue" alt="version">
-  <img src="https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational" alt="platform">
+  <img src="https://img.shields.io/badge/version-1.0.8--oss-blue" alt="version">
+  <img src="https://img.shields.io/badge/platform-linux--amd64%20%7C%20linux--arm64%20%7C%20darwin--amd64%20%7C%20darwin--arm64-informational" alt="platform">
 </p>
 
 ---
