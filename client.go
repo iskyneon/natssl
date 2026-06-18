@@ -29,10 +29,14 @@ func RunClient(cfg *Config) error {
 	if cfg.MasterAddress == "" {
 		return fmt.Errorf("master_address is required in client mode")
 	}
+	if cfg.MasterFingerprint == "" {
+		log.Printf("WARNING: master_fingerprint not set — the first /ca fetch cannot be pinned; " +
+			"set it from the master bootstrap output for full protection")
+	}
 
 	log.Printf("client starting | master=%s", cfg.MasterAddress)
 
-	// 1. Fetch the Root CA from the master and install it into the OS + Firefox.
+	// 1. Fetch the Root CA from the master (pinned) and install it.
 	if err := fetchAndInstallRootCA(cfg); err != nil {
 		log.Printf("WARNING: could not install Root CA yet: %v (will retry on pull)", err)
 	}
@@ -50,10 +54,11 @@ func RunClient(cfg *Config) error {
 	select {}
 }
 
-// fetchAndInstallRootCA downloads the Root CA from the master and installs it.
+// fetchAndInstallRootCA downloads the Root CA from the master over a pinned
+// connection and installs it into the OS + Firefox trust stores.
 func fetchAndInstallRootCA(cfg *Config) error {
 	url := fmt.Sprintf("https://%s:443/ca", host(cfg.MasterAddress))
-	resp, err := insecureMasterClient().Get(url)
+	resp, err := pinnedMasterClient(cfg).Get(url)
 	if err != nil {
 		return err
 	}
@@ -123,8 +128,8 @@ func runCacheReceiver(cfg *Config) {
 	}
 }
 
-// runPullLoop periodically pulls the encrypted cache from the master and
-// refreshes the Root CA. This is the fallback path when push is missed.
+// runPullLoop periodically pulls the encrypted cache from the master (pinned)
+// and refreshes the Root CA. This is the fallback path when push is missed.
 func runPullLoop(cfg *Config) {
 	pull := func() {
 		if _, err := os.Stat(cfg.caCertPath()); err != nil {
@@ -133,7 +138,7 @@ func runPullLoop(cfg *Config) {
 			}
 		}
 		url := fmt.Sprintf("https://%s:443/cache", host(cfg.MasterAddress))
-		resp, err := insecureMasterClient().Get(url)
+		resp, err := pinnedMasterClient(cfg).Get(url)
 		if err != nil {
 			log.Printf("pull: master unreachable (READ-ONLY): %v", err)
 			return

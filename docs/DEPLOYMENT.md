@@ -9,70 +9,78 @@
 
 ---
 
-## 2. Authorization Model
+## 2. Security Controls
 
-NATSSL enforces a strict separation between who may issue what:
+NATSSL applies three independent controls. Understand each before deploying.
+
+### 2.1 Enrollment Token (anti-spoofing)
+
+Self-registration is gated by a **shared secret** sent in the
+`X-Enrollment-Token` header and compared on the master in constant time
+(`subtle.ConstantTimeCompare`). This defeats IP spoofing on flat L2 segments:
+a spoofed source IP alone is useless without the token.
+
+```bash
+# Generate once; put the SAME value on the master and every client.
+openssl rand -hex 32
+```
+
+```yaml
+# master + client
+enrollment_token: "9f1c...the-hex-value..."
+```
+
+> If `enrollment_token` is empty on the master, it logs a startup warning and
+> falls back to **CIDR-only** authorization (spoofable). Always set it in
+> production.
+
+### 2.2 Root CA Pinning (transport)
+
+The client→master path (`/ca`, `/cache`, `/acme/register`, `/acme/sign-csr`)
+is authenticated by **pinning the master's Root CA** instead of using
+`InsecureSkipVerify`. Verification order (`verifyMasterPin` in `netutil.go`):
+
+1. **Fingerprint pin** — if `master_fingerprint` is set, the master's presented
+   certificate must match that SHA-256 exactly. Works even before the CA is on
+   disk (solves the bootstrap chicken-and-egg).
+2. **Chain pin** — otherwise, if the local Root CA file exists, the presented
+   cert must chain to it.
+3. **Fail-closed** — if neither is available, the connection is **refused**.
+
+```yaml
+# client
+master_fingerprint: "AB:CD:EF:...:99"   # colons optional, case-insensitive
+```
+
+```bash
+# Obtain the fingerprint (also printed at master bootstrap):
+openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
+```
+
+> The `InsecureSkipVerify: true` you may see in `pinnedMasterClient` only
+> disables the **hostname** check (the Root CA cert has no SAN for the master's
+> IP). The actual identity check is enforced in `VerifyPeerCertificate`. This
+> is the standard certificate-pinning pattern, not a bypass.
+
+### 2.3 Loopback-Only Client Issuance
 
 | Requester | Mechanism | Allowed targets |
 |---|---|---|
-| **Administrator** | `natssl --mode=master --issue "..."` (local CLI, bypasses HTTP) | **Any** `*.internal` / `*.local` / IP / domain |
-| **Client** | `natssl --mode=client --issue "..."` → CSR-flow to master | **Loopback only**: `localhost`, `127.0.0.1`, `::1` |
+| **Administrator** | `natssl --mode=master --issue "..."` (local CLI, bypasses HTTP) | **Any** domain / IP |
+| **Client** | `natssl --mode=client --issue "..."` → CSR-flow to master | **Loopback only** |
 
-> **Why loopback-only for clients?**
-> All machines on the network trust the single Root CA. If a client could
-> obtain a certificate for an arbitrary host (e.g. `gateway.internal` or
-> another node's IP), it could impersonate that host and perform MITM attacks.
-> Restricting clients to loopback makes any client-issued certificate useless
-> anywhere except the requesting machine itself.
-
-The rule is enforced **twice** (defense in depth):
+Enforced **twice**:
 
 1. **Client-side** (`isLoopbackTarget` in `client_issue.go`) — rejects
-   non-loopback targets before a request ever leaves the machine.
+   non-loopback targets before any request leaves the machine.
 2. **Master-side** (`enforceLoopbackOnly` in `server.go`) — returns **HTTP 403**
-   for any CSR whose SANs are not strictly loopback, even if the client was
-   bypassed or tampered with.
+   for any CSR whose SANs are not strictly loopback.
 
-A third backstop lives in `ca.go` (`SignCSR` validates loopback-only whenever
-`localhost=true`).
+A third backstop lives in `ca.go` (`SignCSR`).
 
-### 2.1 Client Auto-Registration
-
-Clients are **not** listed by hand. The master trusts one or more CIDR ranges;
-any client whose source IP falls inside a range registers itself on startup
-(`register.go` → `/acme/register` on the master in `server.go`).
-
-```mermaid
-sequenceDiagram
-    participant C as Client (boot)
-    participant M as Master
-
-    C->>M: POST /acme/register   (TLS, no body)
-    M->>M: ip = source IP of the connection
-    alt ip in client_networks
-        M->>M: AddClient(ip)  (idempotent)
-        M-->>C: 200 {status: ok, new: true|false}
-        Note over M: client now receives cache push on :8443
-    else ip not allowed
-        M-->>C: 403 not in any allowed client network
-    end
-
-    loop every ping_interval
-        C->>M: POST /acme/register  (re-announce)
-    end
-```
-
-**Master config:**
-
-```yaml
-client_networks:
-  - "192.168.10.0/24"
-  - "10.0.0.0/16"
-```
-
-> If `client_networks` is empty, **no client can self-register** and the master
-> logs a warning at startup. Use the optional static `clients:` list only for
-> special cases. Authorization is by **source IP** — see §7 for hardening.
+> **Why loopback-only?** All machines trust one Root CA. If a client could
+> obtain a cert for an arbitrary host, it could impersonate it and MITM.
+> Loopback certs are useless anywhere except the requesting machine.
 
 ---
 
@@ -104,6 +112,9 @@ sudo cp config.master.yaml /etc/natssl/config.yaml
 # on a client
 sudo cp config.client.yaml /etc/natssl/config.yaml
 ```
+
+> The build is pure-Go (`modernc.org/sqlite`, `CGO_ENABLED=0`) — the binary has
+> no shared-library dependencies beyond libc.
 
 ---
 
@@ -155,16 +166,21 @@ sudo systemctl enable --now natssl-master   # or natssl-client
 
 ```mermaid
 flowchart TD
-    A[Master: --bootstrap] --> B[Write 24 words OFFLINE]
-    B --> C[Copy recovery_public_key from master config]
+    T[Generate enrollment_token: openssl rand -hex 32] --> A[Master: --bootstrap]
+    A --> B[Write 24 words OFFLINE]
+    A --> FP[Note Root CA SHA-256 fingerprint]
+    B --> C[Set enrollment_token + recovery_public_key in master config]
     C --> D[Start natssl-master.service]
-    D --> E[Client: set master_address + recovery_public_key]
+    D --> E[Client config: master_address + master_fingerprint<br/>+ enrollment_token + recovery_public_key]
+    FP --> E
     E --> F[Start natssl-client.service]
-    F --> G[Client installs Root CA into OS + Firefox]
-    G --> H[Client POST /acme/register]
-    H --> I{source IP in client_networks?}
-    I -->|yes| J[Added to push list -> receives cache]
-    I -->|no| K[403 - fix client_networks on master]
+    F --> G[Client pins master, fetches + installs Root CA]
+    G --> H[Client POST /acme/register<br/>X-Enrollment-Token + pinned TLS]
+    H --> I{token valid?}
+    I -->|no| K1[403 invalid token]
+    I -->|yes| J{source IP in client_networks?}
+    J -->|no| K2[403 wrong network]
+    J -->|yes| OK[Added to push list -> receives cache]
 ```
 
 Verify a client joined:
@@ -189,7 +205,7 @@ sequenceDiagram
     participant CA as Root CA
     participant DB as SQLite
     A->>CA: natssl --mode=master --issue "app.internal"
-    CA->>CA: generate key + sign leaf (90d)
+    CA->>CA: generate key + sign leaf
     CA->>DB: store CertRecord
     CA->>CA: RebuildEncryptedCache (AES-GCM + sealed key)
     CA-->>A: write app.internal.crt + app.internal.key
@@ -204,11 +220,11 @@ sequenceDiagram
     participant M as Master (CA)
 
     U->>C: natssl --mode=client --issue "localhost" --localhost
-    C->>C: isLoopbackTarget("localhost")? YES - allowed
+    C->>C: isLoopbackTarget("localhost")? YES
     C->>C: generate ECDSA P-256 keypair LOCALLY
     C->>C: build CSR with loopback SANs only
-    C->>M: POST /acme/sign-csr {csr, localhost:true}
-    M->>M: enforceLoopbackOnly(csr) - reject if any non-loopback SAN
+    C->>M: POST /acme/sign-csr (pinned TLS)
+    M->>M: enforceLoopbackOnly(csr) - reject if non-loopback SAN
     M->>M: SignCSR (second loopback check)
     M-->>C: {certificate}
     C->>U: prompt for password
@@ -226,7 +242,7 @@ sequenceDiagram
     participant M as Master (CA)
 
     U->>C: natssl --mode=client --issue "dev.internal"
-    C->>C: isLoopbackTarget("dev.internal")? NO - not allowed
+    C->>C: isLoopbackTarget("dev.internal")? NO
     C-->>U: error: clients may only issue localhost / 127.0.0.1 / ::1
     Note over C,M: request never reaches the master
 
@@ -258,33 +274,40 @@ flowchart TD
     I --> J[Clients verify & update master IP]
 ```
 
+> Because the Root CA is restored **byte-for-byte**, its SHA-256 fingerprint is
+> unchanged — so every client's existing `master_fingerprint` pin keeps working
+> after promotion. **Only `master_address` needs updating** on clients (the
+> signed migration broadcast handles this automatically).
+
 ### Verifying fingerprint identity
 
 ```bash
 openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
-# the value matches before and after promotion
+# matches the value before and after promotion (and the clients' master_fingerprint)
 ```
 
 ---
 
 ## 8. Hardening (Production)
 
-| Risk | Action |
+| Risk | Status / Action |
 |---|---|
-| `InsecureSkipVerify` in transport | Replace with `RootCAs` and Root CA pinning |
-| `/cache/push` without mTLS | Require a client certificate signed by the Root CA |
-| `/acme/sign-csr` without auth | Loopback-only is enforced, but it is **unauthenticated**; add mTLS or one-time enrollment tokens so only known clients can request even loopback certs |
-| `/acme/register` via source IP | Source IP is spoofable on a flat L2 segment. For production, gate registration behind a one-time enrollment token or mTLS so only known clients can join the push list |
-| Source-IP trust | Do not rely on source IP for authorization beyond coarse network gating — use mTLS identity instead |
-| localhost private key | scrypt(N=2¹⁵)+AES-GCM is **already enabled**; keep the password off the node |
-| seed phrase | store offline (paper/HSM), not in a password manager on the node |
-| file permissions | `root-ca.key`, `*.key.enc`, `network-cache.enc` → `0600` (already set) |
+| Client→master transport | ✅ **Root CA pinned** (`master_fingerprint` or chain). Always set `master_fingerprint`. |
+| Self-registration spoofing | ✅ **Enrollment token** required. Always set `enrollment_token`. |
+| Client privilege escalation | ✅ **Loopback-only** enforced client- and server-side. |
+| `/acme/sign-csr` authentication | ⚠️ Loopback-only is enforced, but the endpoint is **not** authenticated per-client. Add mTLS or one-time tokens so only known clients can request even loopback certs. |
+| `/acme/register` token sharing | ⚠️ The token is **shared** — one leaked client leaks it for all. Rotate periodically; the clean fix is per-client mTLS identities (commercial edition). |
+| `/cache/push` (master→client, :8443) | ⚠️ Not mutually authenticated. Payload is AES-GCM-encrypted + sealed (no plaintext exposure), but enabling strict mTLS on this direction is recommended. |
+| localhost private key | ✅ scrypt(N=2¹⁵)+AES-GCM enabled; keep the password off the node. |
+| seed phrase | Store offline (paper/HSM), not in a password manager on the node. |
+| file permissions | `root-ca.key`, `*.key.enc`, `network-cache.enc` → `0600` (already set). |
+| token in config file | `chmod 600 /etc/natssl/config.yaml` so the shared secret isn't world-readable. |
 
-> **Note on the loopback rule:** `enforceLoopbackOnly` prevents *privilege
-> escalation* (a client cannot obtain a cert for another host), but it does
-> **not** authenticate *which* client is asking. Likewise, `/acme/register`
-> only gates by network. For production, gate both endpoints behind mTLS so
-> only enrolled clients can call them.
+> **Layered defense summary:** the enrollment token authenticates *that a peer
+> is allowed to enroll*; CIDR coarsely gates *where* it may come from; pinning
+> authenticates *the master*; loopback-only limits *what a client can mint*.
+> None of these authenticates *which specific* client is calling — that
+> requires per-client mTLS identities.
 
 ---
 
@@ -299,16 +322,20 @@ nc -vz 192.168.10.5 8443
 journalctl -u natssl-master -f
 journalctl -u natssl-client -f
 
-# Auto-registration
-journalctl -u natssl-master | grep "client registered"     # accepted
-journalctl -u natssl-master | grep "DENIED registration"    # rejected (CIDR)
-journalctl -u natssl-client  | grep "self-registration"     # client side
+# Startup security posture (master)
+journalctl -u natssl-master | grep -E "enrollment|auto-registration|WARNING"
+
+# Auto-registration outcomes
+journalctl -u natssl-master | grep "client registered"            # accepted
+journalctl -u natssl-master | grep "invalid/missing enrollment"   # bad token
+journalctl -u natssl-master | grep "not in client_networks"       # bad CIDR
+journalctl -u natssl-client | grep "self-registration"            # client side
+
+# Pinning failures (client)
+journalctl -u natssl-client | grep -i "fingerprint mismatch\|does not chain\|cannot verify master"
 
 # Denied CSRs on the master
 journalctl -u natssl-master | grep "DENIED CSR"
-
-# Registered clients (over mTLS on :8443)
-# (served by /sync/clients)
 
 # Root CA in the OS
 trust list | grep -A2 NATSSL                              # RHEL family
@@ -327,27 +354,44 @@ openssl x509 -in /var/lib/natssl/issued/localhost.crt -noout -text | \
 
 ## 10. Common Errors
 
-### Client never appears in the push list
+### "registration rejected (403): invalid or missing enrollment token"
 
-The master rejected registration. Check:
+The client's `enrollment_token` does not match the master's. Ensure the **same
+value** is set on both, then restart the client (it retries every
+`ping_interval`).
 
 ```bash
-journalctl -u natssl-master | grep "DENIED registration"
-# DENIED registration from 192.168.99.7 (not in client_networks)
+grep enrollment_token /etc/natssl/config.yaml   # compare on master and client
 ```
-
-Fix `client_networks` on the master to include the client's subnet, then
-restart the master. The client retries automatically every `ping_interval`.
 
 ### "registration rejected (403): your IP is not in any allowed client network"
 
-Same cause, seen from the client side. The client's source IP is outside every
-configured CIDR. Either widen `client_networks` or move the client.
+The token was accepted but the client's source IP is outside every
+`client_networks` CIDR. Widen `client_networks` on the master (and restart it),
+or move the client.
+
+```bash
+journalctl -u natssl-master | grep "not in client_networks"
+# DENIED registration from 192.168.99.7 (not in client_networks)
+```
+
+### "master certificate fingerprint mismatch"
+
+The master's Root CA does not match the client's `master_fingerprint`. Either:
+
+- the value is wrong/stale → re-copy it from
+  `openssl x509 -in root-ca.crt -noout -fingerprint -sha256`, **or**
+- you are talking to a **rogue master** → investigate. Pinning just protected you.
+
+### "cannot verify master: set master_fingerprint in config or install the Root CA locally first"
+
+Neither a fingerprint pin nor a local Root CA is available, so the client
+**fails closed**. Set `master_fingerprint` in the client config (recommended)
+or pre-seed `root-ca.crt` out-of-band.
 
 ### "clients may only issue certificates for localhost / 127.0.0.1 / ::1"
 
-**Expected** — the client tried to request a non-loopback target. Domains/IPs
-must be issued by the administrator on the master:
+**Expected** — the client tried a non-loopback target. Use the master:
 
 ```bash
 sudo natssl --mode=master --issue "dev.internal"
@@ -355,41 +399,44 @@ sudo natssl --mode=master --issue "dev.internal"
 
 ### "master rejected request: clients may only request 'localhost' ..." (HTTP 403)
 
-The master refused a CSR whose SANs were not strictly loopback. This is the
-server-side backstop firing. Check `journalctl -u natssl-master | grep DENIED`
-to see the offending peer.
+The server-side backstop fired (`enforceLoopbackOnly`). Check
+`journalctl -u natssl-master | grep "DENIED CSR"` for the offending peer.
 
 ### "issue failed: master is OFFLINE"
 
 **Expected** (ReadOnly). The client cannot issue while the master is
-unreachable. Options:
-
-1. Bring the master back up.
-2. If the master is physically lost — run `--promote-to-master`.
-3. Already-issued certificates keep working until they expire.
+unreachable. Bring the master back, or `--promote-to-master` if it is lost.
+Already-issued certificates keep working until they expire.
 
 ---
 
 ## 11. FAQ
 
 **Do I still need to list clients by hand?**
-No. Set `client_networks` on the master and `master_address` on each client.
+No. Set `client_networks` + `enrollment_token` on the master, and
+`master_address` + `master_fingerprint` + `enrollment_token` on each client.
 Clients self-register on startup and re-register every `ping_interval`.
 
-**Why doesn't the client sign on its own?**
-Trust is built on a single Root CA. Distributing its key to every machine
-would compromise the entire network. The CSR-flow keeps signing centralized
-while the leaf private key stays on the client.
+**What stops a random host from registering?**
+Two gates: it needs the shared **enrollment token** *and* a source IP inside
+`client_networks`. The token defeats IP spoofing on a flat L2 segment.
+
+**What stops a fake master from impersonating the real one?**
+**Root CA pinning.** The client verifies the master's certificate against
+`master_fingerprint` (or that it chains to the installed Root CA) and fails
+closed otherwise.
 
 **Why can a client only issue loopback certificates?**
-To prevent host impersonation. A loopback certificate is useless anywhere
-except the requesting machine, so a compromised or malicious client cannot use
-the shared Root CA to MITM other hosts. Real domain/IP certificates are an
-administrator action on the master.
+To prevent host impersonation. A loopback cert is useless anywhere except the
+requesting machine. Real domain/IP certs are an administrator action on the
+master.
+
+**Can I rotate the enrollment token?**
+Yes — change it on the master and on all clients. Clients re-register on the
+next `ping_interval`. Because it is shared, rotate after any client compromise.
 
 **What if the seed phrase is lost?**
-Recovery is impossible — there is nothing to decrypt the cache with. This is
-by design.
+Recovery is impossible — there is nothing to decrypt the cache with. By design.
 
 **Why can't the Root CA be regenerated with the same fingerprint without a backup?**
 The SHA-256 fingerprint is the hash of the DER encoding (including the

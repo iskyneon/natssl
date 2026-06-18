@@ -10,21 +10,33 @@ import (
 )
 
 // RegisterWithMaster announces this client to the master so it gets added to
-// the push list automatically. Identification is by source IP on the master
-// side; this call carries no body. Idempotent.
+// the push list automatically. Authorization on the master is by enrollment
+// token (anti-spoofing) AND source-IP CIDR. The connection is pinned to the
+// master's Root CA. Idempotent.
 func RegisterWithMaster(cfg *Config) error {
 	if cfg.MasterAddress == "" {
 		return fmt.Errorf("master_address is empty; cannot self-register")
 	}
 	url := fmt.Sprintf("https://%s:443/acme/register", host(cfg.MasterAddress))
-	resp, err := insecureMasterClient().Post(url, "application/json", strings.NewReader("{}"))
+
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader("{}"))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.EnrollmentToken != "" {
+		req.Header.Set("X-Enrollment-Token", cfg.EnrollmentToken)
+	}
+
+	resp, err := pinnedMasterClient(cfg).Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		msg, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("registration rejected (%d): %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return fmt.Errorf("registration rejected (%d): %s",
+			resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	return nil
 }

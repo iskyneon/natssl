@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
@@ -14,167 +15,229 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/scrypt"
 	"golang.org/x/term"
 )
 
-// isLoopbackTarget reports whether a client is allowed to request `target`.
-// Clients may ONLY issue loopback certificates: localhost / 127.0.0.1 / ::1.
-func isLoopbackTarget(target string, localhost bool) bool {
-	t := strings.TrimSpace(strings.ToLower(target))
-	if t == "localhost" {
+// scrypt parameters for encrypting the leaf private key at rest.
+const (
+	scryptN      = 1 << 15 // 32768
+	scryptR      = 8
+	scryptP      = 1
+	scryptKeyLen = 32 // AES-256
+	saltLen      = 16
+)
+
+// isLoopbackTarget reports whether the requested subject is strictly loopback.
+// This is the CLIENT-SIDE half of the loopback-only rule; the master enforces
+// the same rule again in enforceLoopbackOnly (defense in depth).
+func isLoopbackTarget(subject string) bool {
+	s := strings.TrimSpace(strings.ToLower(subject))
+	switch s {
+	case "localhost", "127.0.0.1", "::1":
 		return true
 	}
-	if ip := net.ParseIP(t); ip != nil && ip.IsLoopback() {
-		return true // 127.0.0.1, ::1, 127.x.x.x
-	}
-	if t == "" && localhost {
-		return true
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.IsLoopback()
 	}
 	return false
 }
 
-// RunClientIssue lets a client issue a loopback certificate FOR ITSELF via the
-// CSR-flow. The private key is generated locally and NEVER leaves the machine.
-func RunClientIssue(cfg *Config, target string, localhost bool) error {
-	// ── HARD RULE: clients may only issue loopback certificates ─────────
-	if !isLoopbackTarget(target, localhost) {
-		return fmt.Errorf("clients may only issue certificates for localhost / 127.0.0.1 / ::1.\n"+
-			"  Requested %q is not allowed.\n"+
-			"  Tip: use  natssl --mode=client --issue \"localhost\" --localhost\n"+
-			"  Domain/IP certificates must be issued by the administrator on the master.", target)
+// loopbackSANs returns the DNS and IP SANs for a given loopback subject.
+func loopbackSANs(subject string) (dns []string, ips []net.IP) {
+	s := strings.TrimSpace(strings.ToLower(subject))
+	if ip := net.ParseIP(s); ip != nil {
+		return nil, []net.IP{ip}
 	}
-	localhost = true // loopback targets are always issued in localhost mode
-	// ────────────────────────────────────────────────────────────────────
+	// subject == "localhost"
+	return []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+}
 
-	// 1. Issuance requires a LIVE master: in ReadOnly mode new issuance is blocked.
-	if !tcpHealthy(host(cfg.MasterAddress), 5*time.Second, 443) {
-		return fmt.Errorf("master %s is OFFLINE — new issuance blocked (READ-ONLY mode)", cfg.MasterAddress)
+// RunClientIssue issues a LOOPBACK-ONLY certificate for this machine using the
+// CSR-flow: the private key is generated locally and never leaves the machine.
+// The master signs the CSR (and independently re-enforces the loopback rule).
+//
+//	natssl --mode=client --issue "localhost" [--localhost]
+func RunClientIssue(cfg *Config, subject string, localhost bool) error {
+	if cfg.MasterAddress == "" {
+		return fmt.Errorf("master_address is required to issue certificates")
 	}
 
-	// 2. Generate the leaf private key locally.
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// ── CLIENT-SIDE HARD RULE: loopback only ──────────────────────────────
+	if !isLoopbackTarget(subject) {
+		return fmt.Errorf(
+			"clients may only issue certificates for localhost / 127.0.0.1 / ::1.\n"+
+				"  %q is not a loopback target.\n"+
+				"  Domain/IP certificates must be issued by the administrator on the master:\n"+
+				"      natssl --mode=master --issue %q", subject, subject)
+	}
+	// The flag is implied for loopback subjects; normalize it for the master.
+	localhost = true
+
+	// ── ReadOnly guard: refuse to issue if the master is unreachable ───────
+	if !tcpHealthy(host(cfg.MasterAddress), 3*time.Second, 443) {
+		return fmt.Errorf("issue failed: master is OFFLINE (READ-ONLY mode). " +
+			"Existing certificates keep working; new issuance requires the master")
+	}
+
+	// 1. Generate the leaf keypair LOCALLY.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate key: %w", err)
+	}
+
+	// 2. Build a CSR with loopback SANs only.
+	dns, ips := loopbackSANs(subject)
+	csrTmpl := &x509.CertificateRequest{
+		Subject:     pkix.Name{CommonName: subject},
+		DNSNames:    dns,
+		IPAddresses: ips,
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, csrTmpl, key)
+	if err != nil {
+		return fmt.Errorf("create CSR: %w", err)
+	}
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+	// Public key (for the master's audit record).
+	pubDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		return fmt.Errorf("marshal public key: %w", err)
+	}
+	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
+
+	// 3. Ask the master to sign it (pinned transport).
+	certPEM, err := requestCSRSign(cfg, string(csrPEM), string(pubPEM), localhost)
 	if err != nil {
 		return err
 	}
 
-	// 3. Build the CSR with loopback SANs only.
-	dnsNames := []string{"localhost"}
-	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader,
-		&x509.CertificateRequest{
-			Subject:     pkix.Name{CommonName: "localhost (Same PC only)"},
-			DNSNames:    dnsNames,
-			IPAddresses: ips,
-		}, leafKey)
+	// 4. Prompt for a password and encrypt the private key at rest.
+	password, err := promptPassword("Set a password to encrypt the private key: ")
 	if err != nil {
 		return err
 	}
-	csrPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
-
-	// 4. Send the CSR to the master for signing.
-	body, _ := json.Marshal(map[string]any{"csr": csrPEM, "localhost": true})
-	resp, err := insecureMasterClient().Post(
-		fmt.Sprintf("https://%s:443/acme/sign-csr", host(cfg.MasterAddress)),
-		"application/json", strings.NewReader(string(body)))
-	if err != nil {
-		return fmt.Errorf("master request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		msg, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("master rejected request: %s", strings.TrimSpace(string(msg)))
-	}
-	var out struct {
-		Certificate string `json:"certificate"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return err
-	}
-
-	// 5. Encrypt the private key with the user's LOCAL password (scrypt + AES-GCM).
-	keyDER, _ := x509.MarshalPKCS8PrivateKey(leafKey)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-
-	fmt.Print("Set a password to encrypt the private key (Same-PC only): ")
-	pw1, err := term.ReadPassword(int(os.Stdin.Fd()))
+	confirm, err := promptPassword("Confirm password: ")
 	if err != nil {
 		return err
 	}
-	fmt.Print("\nConfirm password: ")
-	pw2, err := term.ReadPassword(int(os.Stdin.Fd()))
-	if err != nil {
-		return err
-	}
-	fmt.Println()
-	if string(pw1) != string(pw2) {
+	if password != confirm {
 		return fmt.Errorf("passwords do not match")
 	}
-	if len(pw1) == 0 {
+	if len(password) == 0 {
 		return fmt.Errorf("empty password is not allowed")
 	}
-	encKey, err := encryptKeyWithPassword(keyPEM, pw1)
+
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal private key: %w", err)
+	}
+	encKey, err := encryptKey(keyDER, password)
+	if err != nil {
+		return fmt.Errorf("encrypt private key: %w", err)
 	}
 
-	// 6. Persist artifacts.
-	dir := cfg.issuedDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// 5. Persist cert (plaintext) + key (encrypted) under issued/.
+	if err := os.MkdirAll(cfg.issuedDir(), 0o755); err != nil {
 		return err
 	}
-	base := strings.NewReplacer("*", "_", "/", "_", ":", "_").Replace(target)
-	if base == "" {
-		base = "localhost"
-	}
-	crtPath := dir + "/" + base + ".crt"
-	keyPath := dir + "/" + base + ".key.enc"
-	if err := os.WriteFile(crtPath, []byte(out.Certificate), 0o644); err != nil {
+	base := sanitizeName(subject)
+	certPath := filepath.Join(cfg.issuedDir(), base+".crt")
+	keyPath := filepath.Join(cfg.issuedDir(), base+".key.enc")
+
+	if err := os.WriteFile(certPath, []byte(certPEM), 0o644); err != nil {
 		return err
 	}
 	if err := os.WriteFile(keyPath, encKey, 0o600); err != nil {
 		return err
 	}
 
-	fmt.Printf("\n\u2714 Loopback certificate issued for %q\n", target)
-	fmt.Printf("  cert: %s\n", crtPath)
-	fmt.Printf("  key : %s  (encrypted, this PC only)\n", keyPath)
-	fmt.Printf("\nDecrypt the key when needed:\n")
-	fmt.Printf("  natssl --mode=client --decrypt-key=%s > /tmp/%s.key\n", keyPath, base)
+	fmt.Println("============================================================")
+	fmt.Printf(" ✔ Loopback certificate issued for %q\n", subject)
+	fmt.Println("   cert:", certPath)
+	fmt.Println("   key :", keyPath, " (encrypted, this PC only)")
+	fmt.Println("------------------------------------------------------------")
+	fmt.Println(" Decrypt the key for use with:")
+	fmt.Printf("   natssl --mode=client --decrypt-key=%s > key.pem\n", keyPath)
+	fmt.Println("============================================================")
 	return nil
 }
 
-// RunDecryptKey decrypts a .key.enc file (prompting for the password) to stdout.
-func RunDecryptKey(path string) error {
-	blob, err := os.ReadFile(path)
+// requestCSRSign POSTs the CSR to the master and returns the signed cert PEM.
+// Uses the pinned client so a rogue master / MITM is rejected.
+func requestCSRSign(cfg *Config, csrPEM, pubPEM string, localhost bool) (string, error) {
+	url := fmt.Sprintf("https://%s:443/acme/sign-csr", host(cfg.MasterAddress))
+	body, _ := json.Marshal(map[string]any{
+		"csr":        csrPEM,
+		"client_pub": pubPEM,
+		"localhost":  localhost,
+	})
+
+	resp, err := pinnedMasterClient(cfg).Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("contact master: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("master rejected request (%d): %s",
+			resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+
+	var out struct {
+		Certificate string `json:"certificate"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return "", fmt.Errorf("parse master response: %w", err)
+	}
+	if out.Certificate == "" {
+		return "", fmt.Errorf("master returned an empty certificate")
+	}
+	return out.Certificate, nil
+}
+
+// RunDecryptKey decrypts a .key.enc file and writes the PEM private key to
+// stdout, so it can be redirected to a file:
+//
+//	natssl --mode=client --decrypt-key=localhost.key.enc > key.pem
+func RunDecryptKey(cfg *Config, path string) error {
+	enc, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	fmt.Fprint(os.Stderr, "Password: ")
-	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Fprintln(os.Stderr)
+	password, err := promptPassword("Password to decrypt the private key: ")
 	if err != nil {
 		return err
 	}
-	plain, err := DecryptKeyWithPassword(blob, pw)
+	keyDER, err := decryptKey(enc, password)
 	if err != nil {
-		return fmt.Errorf("wrong password or corrupted key file")
+		return fmt.Errorf("decrypt failed (wrong password?): %w", err)
 	}
-	_, err = os.Stdout.Write(plain)
+	// Re-encode as PKCS#8 PEM for portability.
+	if _, err := x509.ParsePKCS8PrivateKey(keyDER); err != nil {
+		return fmt.Errorf("decrypted data is not a valid private key: %w", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	_, err = os.Stdout.Write(pemBytes)
 	return err
 }
 
-// --- scrypt + AES-GCM ----------------------------------------------------
+// --- key-at-rest encryption (scrypt KDF + AES-256-GCM) --------------------
+//
+// On-disk layout:  [ salt(16) | nonce(12) | ciphertext+tag ]
 
-func encryptKeyWithPassword(plaintext, password []byte) ([]byte, error) {
-	salt := make([]byte, 16)
+func encryptKey(plaintext []byte, password string) ([]byte, error) {
+	salt := make([]byte, saltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, err
 	}
-	dk, err := scrypt.Key(password, salt, 1<<15, 8, 1, 32)
+	dk, err := scrypt.Key([]byte(password), salt, scryptN, scryptR, scryptP, scryptKeyLen)
 	if err != nil {
 		return nil, err
 	}
@@ -191,15 +254,22 @@ func encryptKeyWithPassword(plaintext, password []byte) ([]byte, error) {
 		return nil, err
 	}
 	ct := gcm.Seal(nil, nonce, plaintext, nil)
-	return json.Marshal(map[string][]byte{"salt": salt, "nonce": nonce, "ct": ct})
+
+	out := make([]byte, 0, len(salt)+len(nonce)+len(ct))
+	out = append(out, salt...)
+	out = append(out, nonce...)
+	out = append(out, ct...)
+	return out, nil
 }
 
-func DecryptKeyWithPassword(blob, password []byte) ([]byte, error) {
-	var m map[string][]byte
-	if err := json.Unmarshal(blob, &m); err != nil {
-		return nil, err
+func decryptKey(blob []byte, password string) ([]byte, error) {
+	if len(blob) < saltLen+12+16 {
+		return nil, fmt.Errorf("ciphertext too short / corrupted")
 	}
-	dk, err := scrypt.Key(password, m["salt"], 1<<15, 8, 1, 32)
+	salt := blob[:saltLen]
+	rest := blob[saltLen:]
+
+	dk, err := scrypt.Key([]byte(password), salt, scryptN, scryptR, scryptP, scryptKeyLen)
 	if err != nil {
 		return nil, err
 	}
@@ -211,5 +281,36 @@ func DecryptKeyWithPassword(blob, password []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return gcm.Open(nil, m["nonce"], m["ct"], nil)
+	ns := gcm.NonceSize()
+	if len(rest) < ns {
+		return nil, fmt.Errorf("ciphertext too short / corrupted")
+	}
+	nonce := rest[:ns]
+	ct := rest[ns:]
+	return gcm.Open(nil, nonce, ct, nil)
+}
+
+// --- helpers --------------------------------------------------------------
+
+// promptPassword reads a password from the terminal without echoing it.
+func promptPassword(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	b, err := term.ReadPassword(int(syscall.Stdin))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// sanitizeName turns a subject into a safe filename base.
+func sanitizeName(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	repl := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_",
+		"?", "_", "\"", "_", "<", "_", ">", "_", "|", "_", " ", "_")
+	s = repl.Replace(s)
+	if s == "" {
+		s = "cert"
+	}
+	return s
 }

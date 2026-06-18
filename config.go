@@ -22,7 +22,9 @@ type Config struct {
 	DataDir           string        `yaml:"data_dir"`            // /var/lib/natssl
 	Listen            Listen        `yaml:"listen"`              // ports
 	MasterAddress     string        `yaml:"master_address"`      // client -> master host/IP
+	MasterFingerprint string        `yaml:"master_fingerprint"`  // client: SHA-256 of master Root CA (pinning)
 	RecoveryPublicKey string        `yaml:"recovery_public_key"` // base64, auto-filled on bootstrap
+	EnrollmentToken   string        `yaml:"enrollment_token"`    // shared secret for /acme/register
 	ClientNetworks    []string      `yaml:"client_networks"`     // master: CIDRs allowed to self-register
 	Clients           []string      `yaml:"clients"`             // optional static push targets (fallback)
 	PullInterval      time.Duration `yaml:"pull_interval"`       // cache pull/push cadence

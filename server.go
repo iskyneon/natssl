@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -77,7 +78,7 @@ func RunBootstrap(cfg *Config) error {
 
 	fmt.Println("============================================================")
 	fmt.Println(" NATSSL Root CA initialized (valid 10 years).")
-	fmt.Println(" SHA-256 fingerprint:")
+	fmt.Println(" SHA-256 fingerprint (copy to clients as master_fingerprint):")
 	fmt.Println("   " + ca.Fingerprint())
 	fmt.Println("------------------------------------------------------------")
 	fmt.Println(" DISASTER RECOVERY SEED PHRASE (24 words) — SHOWN ONCE.")
@@ -111,6 +112,17 @@ func enforceLoopbackOnly(csr *x509.CertificateRequest, localhost bool) error {
 	return nil
 }
 
+// checkEnrollment validates the shared enrollment token (constant-time). If no
+// token is configured on the master, it logs a warning and allows the request
+// to fall through to the network (CIDR) gate only.
+func checkEnrollment(cfg *Config, r *http.Request) bool {
+	if cfg.EnrollmentToken == "" {
+		return true // no token configured -> rely on CIDR only (logged at startup)
+	}
+	got := r.Header.Get("X-Enrollment-Token")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(cfg.EnrollmentToken)) == 1
+}
+
 // RunMaster starts the master: ACME API on :443 and mTLS management on :8443.
 func RunMaster(cfg *Config) error {
 	ca, err := LoadCA(cfg.caCertPath(), cfg.caKeyPath())
@@ -134,6 +146,11 @@ func RunMaster(cfg *Config) error {
 	} else {
 		log.Printf("WARNING: client_networks is empty — clients cannot self-register")
 	}
+	if cfg.EnrollmentToken == "" {
+		log.Printf("WARNING: enrollment_token not set — registration relies on source IP only (spoofable on flat L2)")
+	} else {
+		log.Printf("enrollment token required for registration (anti-spoofing enabled)")
+	}
 
 	// Port 443 — ACME-compatible issuance API.
 	acmeMux := http.NewServeMux()
@@ -147,11 +164,18 @@ func RunMaster(cfg *Config) error {
 		http.ServeFile(w, r, cfg.cachePath())
 	})
 
-	// Client self-registration. The peer is identified by its real source IP
-	// (cannot be forged without network-level spoofing) and must fall inside a
-	// configured client_networks CIDR.
+	// Client self-registration. Authorization = enrollment token (anti-spoofing)
+	// AND source-IP CIDR. Both must pass.
 	acmeMux.HandleFunc("/acme/register", func(w http.ResponseWriter, r *http.Request) {
 		ip := host(r.RemoteAddr)
+
+		// 1. Enrollment token — defeats IP spoofing on flat L2 segments.
+		if !checkEnrollment(cfg, r) {
+			log.Printf("DENIED registration from %s (invalid/missing enrollment token)", ip)
+			http.Error(w, "invalid or missing enrollment token", 403)
+			return
+		}
+		// 2. Network gate.
 		if !cfg.ClientAllowed(ip) {
 			log.Printf("DENIED registration from %s (not in client_networks)", ip)
 			http.Error(w, "your IP is not in any allowed client network", 403)
@@ -290,7 +314,10 @@ func pushCacheToClients(cfg *Config, st *Store) {
 	if err != nil {
 		return
 	}
-	client := insecureMasterClient() // client trusts our Root CA
+	// master -> client receiver uses an ephemeral self-signed cert; the payload
+	// is already AES-GCM encrypted + sealed, so this direction is intentionally
+	// not pinned in the OSS edition.
+	client := insecureMasterClient()
 	for _, c := range cls {
 		url := fmt.Sprintf("https://%s:8443/cache/push", host(c))
 		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(string(data)))
