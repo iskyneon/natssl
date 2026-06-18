@@ -15,7 +15,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     -o /out/natssl .
 
 # ---- runtime ----
+# ---- runtime ----
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+RUN sed -i 's|https\?://dl-cdn.alpinelinux.org/alpine|https://mirror.yandex.ru/mirrors/alpine|g' /etc/apk/repositories \
+ && apk add --no-cache openssl ca-certificates
 COPY --from=build /out/natssl /usr/local/bin/natssl
 ENTRYPOINT ["natssl"]
+
