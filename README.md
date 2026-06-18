@@ -1,6 +1,19 @@
-# NATSSL
+<p align="center">
+  <img src="assets/logo.png" alt="NATSSL logo" width="260">
+</p>
 
-**Zero-Configuration Distributed TLS for Private Infrastructure.**
+<h3 align="center">Zero-Configuration Distributed TLS for Private Infrastructure</h3>
+
+<p align="center">
+  A single binary acting as a Certificate Authority (Root CA) for private
+  networks, with disaster recovery via a 24-word BIP-39 seed phrase —
+  no mDNS, no cloud.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.0.7--oss-blue" alt="version">
+  <img src="https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational" alt="platform">
+</p>
 
 A single binary acting as a Certificate Authority (Root CA) for private
 networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
