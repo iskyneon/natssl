@@ -15,13 +15,6 @@
   <img src="https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational" alt="platform">
 </p>
 
-A single binary acting as a Certificate Authority (Root CA) for private
-networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
-no cloud.
-
-![status](https://img.shields.io/badge/version-1.0.7--oss-blue)
-![platform](https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational)
-
 ---
 
 ## Table of Contents
