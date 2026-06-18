@@ -248,7 +248,7 @@ sudo natssl --mode=master --issue "*.internal"
 | IP address (v4/v6) | `IP Address:` | `192.168.1.2`, `fd00::1` |
 | Wildcard | `DNS:` | `*.internal` |
 
-**Validity:** 90 days. Re-issue with the same command to renew (a new serial is
+**Validity:** 1 year. Re-issue with the same command to renew (a new serial is
 minted; revoke the old one with `--revoke` if needed).
 
 **Output files:**
