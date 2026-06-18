@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="NATSSL logo" width="260">
+  <img src="assets/natssl.png" alt="NATSSL logo" width="260">
 </p>
 
 <h3 align="center">Zero-Configuration Distributed TLS for Private Infrastructure</h3>
