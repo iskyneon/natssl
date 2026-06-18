@@ -76,6 +76,28 @@ Root CA.
 
 ---
 
+---
+
+## Download
+
+Pre-built binaries for **1.0.8** ([release page](https://github.com/iskyneon/natssl/releases/tag/1.0.8)):
+
+| Platform | Architecture | Download |
+|---|---|---|
+| Linux | amd64 | [natssl-1.0.8-oss-linux-amd64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.8/natssl-1.0.8-oss-linux-amd64.tar.gz) |
+| Linux | arm64 | [natssl-1.0.8-oss-linux-arm64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.8/natssl-1.0.8-oss-linux-arm64.tar.gz) |
+| macOS (Intel) | amd64 | [natssl-1.0.8-oss-darwin-amd64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.8/natssl-1.0.8-oss-darwin-amd64.tar.gz) |
+| macOS (Apple Silicon) | arm64 | [natssl-1.0.8-oss-darwin-arm64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.8/natssl-1.0.8-oss-darwin-arm64.tar.gz) |
+
+```bash
+# example: Linux amd64
+curl -fsSL -O https://github.com/iskyneon/natssl/releases/download/1.0.8/natssl-1.0.8-oss-linux-amd64.tar.gz
+tar -xzf natssl-1.0.8-oss-linux-amd64.tar.gz
+sudo install -m 0755 natssl-1.0.8-oss-linux-amd64 /usr/local/bin/natssl
+natssl --version
+
+---
+
 ## Requirements
 
 - **Go 1.22+** (for building)
