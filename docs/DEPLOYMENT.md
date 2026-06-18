@@ -222,7 +222,7 @@ restored CA's fingerprint matches. DB restore is a single transaction.
 | Spoofable registration | ✅ Mandatory token (fail-closed) + CIDR |
 | Pin ambiguity | ✅ Pin to Root CA + chain verify |
 | Revocation | ⚠️ List via `/sync/crl`; full CRL/OCSP = next step |
-| Shared token | ⚠️ Rotate on compromise; one-time tokens = commercial |
+| Shared token | ⚠️ Rotate on compromise; one-time tokens |
 | Migration transport | ⚠️ Unverified TLS, but payload signed by Root CA |
 
 ---
