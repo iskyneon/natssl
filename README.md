@@ -40,18 +40,28 @@ no cloud.
 
 ## Architecture
 
-```
-        ┌──────────────┐  443 ACME / 8443 mTLS   ┌──────────────┐
-        │   MASTER      │ ───── issue / cache ───▶ │   CLIENT      │
-        │  Root CA      │ ◀──── CSR sign ───────── │  Cert Store   │
-        │  SQLite       │ ◀──── pull (1h) ──────── │  (read-only   │
-        │  recovery-pub │                          │   enc cache)  │
-        └──────┬───────┘                          └──────┬───────┘
-               │ AES-GCM-256(snapshot)                    │
-               │ key sealed by recovery PUBLIC key        │
-               ▼                                          ▼
-        network-cache.enc  ───────── replicated ────────▶ stored as
-                                                          "dead weight"
+```mermaid
+flowchart LR
+    subgraph M["MASTER"]
+        direction TB
+        RCA["Root CA"]
+        DB["SQLite"]
+        RPUB["recovery-pub"]
+    end
+
+    subgraph C["CLIENT"]
+        direction TB
+        CS["Cert Store"]
+        ENC["encrypted cache<br/>(read-only)"]
+    end
+
+    M -- "issue / cache (443)" --> C
+    C -- "CSR sign (443)" --> M
+    C -- "pull every 1h" --> M
+    M -- "push network-cache.enc (8443)" --> C
+
+    M -. "AES-GCM-256(snapshot)<br/>key sealed by recovery PUBLIC key" .-> CACHE["network-cache.enc<br/>stored as 'dead weight'"]
+    C -. "replicated" .-> CACHE
 ```
 
 On disaster, a client holding the seed phrase decrypts the cache and becomes
