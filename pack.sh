@@ -1,25 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
-SRC="natssl"
-mkdir -p "$SRC/docs"
 
-# ВНИМАНИЕ: сюда нужно положить .go-файлы из предыдущего ответа:
-#   main.go config.go recovery.go cache.go ca.go store.go
-#   server.go client.go promote.go netutil.go install.go
-# Этот скрипт упаковывает уже существующие файлы каталога.
+OUT="natssl-src.tar.gz"
 
-REQUIRED=(main.go config.go recovery.go cache.go ca.go store.go \
-          server.go client.go client_issue.go promote.go netutil.go install.go \
-          go.mod Makefile build.sh README.md docs/DEPLOYMENT.md)
+# Prefer `git archive` when inside a clean git repo: it packs exactly the
+# tracked files and never goes stale when new source files are added.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	echo ">> packing tracked files via git archive"
+	git archive --format=tar.gz --prefix="natssl/" -o "$OUT" HEAD
+	echo ">> done: $OUT"
+	ls -lah "$OUT"
+	exit 0
+fi
 
-missing=0
-for f in "${REQUIRED[@]}"; do
-  if [[ ! -f "$SRC/$f" ]]; then
-    echo "MISSING: $SRC/$f"; missing=1
-  fi
-done
-[[ $missing -eq 0 ]] || { echo "Положите недостающие файлы и повторите."; exit 1; }
+# Fallback: explicit file list (kept in sync manually).
+echo ">> not a git repo — packing explicit file list"
+FILES=(
+	ca.go
+	cache.go
+	client.go
+	client_issue.go
+	config.go
+	install.go
+	main.go
+	netutil.go
+	promote.go
+	recovery.go
+	register.go
+	server.go
+	store.go
 
-tar -czf natssl-src.tar.gz "$SRC"
-sha256sum natssl-src.tar.gz
-echo ">> archive ready: natssl-src.tar.gz"
+	config.master.yaml
+	config.client.yaml
+	go.mod
+	go.sum
+
+	build.sh
+	pack.sh
+	Makefile
+
+	README.md
+	docs/DEPLOYMENT.md
+
+	natssl-master.service
+	natssl-client.service
+)
+
+tar -czf "$OUT" --transform 's,^,natssl/,' "${FILES[@]}"
+echo ">> done: $OUT"
+ls -lah "$OUT"

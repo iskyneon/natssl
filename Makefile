@@ -1,53 +1,52 @@
-# ============================================================
-#  NATSSL — Makefile (cross-compilation amd64 / arm64)
-# ============================================================
-BINARY      := natssl
-VERSION     := 1.0.0-oss
-COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo "nogit")
-DATE        := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-DIST        := dist
+VERSION ?= 1.0.0-oss
+BINARY  := natssl
+OUT     := dist
 
-# CGO выключен -> чистый статический бинарник (modernc.org/sqlite — pure Go)
+# Pure-Go SQLite (modernc.org/sqlite): keep CGO off for clean cross-compile.
 export CGO_ENABLED=0
 
-LDFLAGS := -s -w \
-	-X 'main.Version=$(VERSION)' \
-	-X 'main.Commit=$(COMMIT)' \
-	-X 'main.BuildDate=$(DATE)'
+LDFLAGS := -s -w -X main.version=$(VERSION)
 
-# Список целей: GOOS/GOARCH
-PLATFORMS := linux/amd64 linux/arm64
+.PHONY: all build release clean test tidy vet fmt run-master run-client pack
 
-.PHONY: all clean tidy build release checksums help
+all: build
 
-all: release ## Собрать релизы под все платформы
+## build: compile a native binary into ./$(BINARY)
+build:
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) .
 
-help: ## Показать список целей
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n",$$1,$$2}'
+## release: cross-compile amd64 + arm64 tarballs into ./$(OUT)
+release:
+	./build.sh
 
-tidy: ## go mod tidy
+## pack: archive the source tree into natssl-src.tar.gz
+pack:
+	./pack.sh
+
+## test: run unit tests
+test:
+	go test ./...
+
+## tidy: sync go.mod / go.sum
+tidy:
 	go mod tidy
 
-build: tidy ## Локальная сборка под текущую платформу
-	go build -trimpath -ldflags="$(LDFLAGS)" -o $(BINARY) .
+## vet: static checks
+vet:
+	go vet ./...
 
-release: tidy ## Кросс-компиляция под amd64 и arm64
-	@mkdir -p $(DIST)
-	@for p in $(PLATFORMS); do \
-		os=$${p%/*}; arch=$${p#*/}; \
-		out=$(DIST)/$(BINARY)-$(VERSION)-$$os-$$arch; \
-		echo ">> building $$os/$$arch"; \
-		GOOS=$$os GOARCH=$$arch go build -trimpath \
-			-ldflags="$(LDFLAGS)" -o $$out . ; \
-		tar -C $(DIST) -czf $$out.tar.gz $$(basename $$out) ; \
-		rm -f $$out ; \
-	done
-	@$(MAKE) checksums
+## fmt: format all sources
+fmt:
+	gofmt -s -w .
 
-checksums: ## Посчитать SHA-256 для артефактов
-	@cd $(DIST) && sha256sum *.tar.gz > SHA256SUMS.txt && \
-		echo ">> checksums:" && cat SHA256SUMS.txt
+## run-master: run locally as master (needs root for :443)
+run-master: build
+	sudo ./$(BINARY) --mode=master --config=./config.master.yaml
 
-clean: ## Очистить артефакты
-	rm -rf $(DIST) $(BINARY)
+## run-client: run locally as client
+run-client: build
+	sudo ./$(BINARY) --mode=client --config=./config.client.yaml
+
+## clean: remove build artifacts
+clean:
+	rm -rf $(BINARY) $(OUT) natssl-src.tar.gz
