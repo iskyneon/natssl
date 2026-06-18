@@ -9,7 +9,7 @@ mkdir -p "$SRC/docs"
 # Этот скрипт упаковывает уже существующие файлы каталога.
 
 REQUIRED=(main.go config.go recovery.go cache.go ca.go store.go \
-          server.go client.go promote.go netutil.go install.go \
+          server.go client.go client_issue.go promote.go netutil.go install.go \
           go.mod Makefile build.sh README.md docs/DEPLOYMENT.md)
 
 missing=0

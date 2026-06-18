@@ -77,6 +77,8 @@ sudo systemctl enable --now natssl-master   # или natssl-client
 
 ## 4. Жизненный цикл сертификата
 
+### 4.1 Мастер генерирует ключ (`/acme/new-order`)
+
 ```mermaid
 sequenceDiagram
     participant C as Client
@@ -86,6 +88,25 @@ sequenceDiagram
     M->>M: RebuildEncryptedCache (AES-GCM + sealed key)
     M-->>C: {certificate, private_key}
     M-->>C: push network-cache.enc (8443)
+```
+
+### 4.2 Клиент выписывает СЕБЕ через CSR (`/acme/sign-csr`)
+
+```mermaid
+sequenceDiagram
+    participant U as User on Client
+    participant C as natssl client
+    participant M as Master (CA)
+    U->>C: natssl --mode=client --issue localhost --localhost
+    C->>C: generate ECDSA P-256 keypair LOCALLY
+    C->>C: build CSR (public key only)
+    C->>M: POST /acme/sign-csr {csr, localhost}
+    M->>M: SignCSR (validates loopback-only for localhost)
+    M-->>C: {certificate}
+    C->>U: ask password
+    C->>C: scrypt + AES-GCM encrypt private key
+    C->>C: save .crt + .key.enc (0600)
+    Note over C: приватный ключ НИКОГДА не уходил с машины
 ```
 
 ---
@@ -113,11 +134,8 @@ flowchart TD
 ### Проверка идентичности отпечатка
 
 ```bash
-# До катастрофы (на старом мастере, если есть бэкап):
 openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
-
-# После promote (на новом мастере) — значение совпадает.
-openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
+# значение совпадает до и после promote
 ```
 
 ---
@@ -128,16 +146,17 @@ openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
 |---|---|
 | `InsecureSkipVerify` в транспорте | Заменить на `RootCAs` с пиннингом Root CA |
 | `/cache/push` без mTLS | Требовать клиентский сертификат, подписанный Root CA |
-| localhost private key в открытом виде | scrypt + AES-GCM, пароль пользователя |
+| `/acme/sign-csr` без аутентификации | Добавить mTLS/одноразовый токен на клиента |
+| localhost private key | scrypt(N=2¹⁵)+AES-GCM **уже включено**; храните пароль вне узла |
 | seed-фраза | хранить offline (бумага/HSM), не в pass-менеджере на узле |
-| права на файлы | `root-ca.key`, `network-cache.enc` → `0600` (уже задано) |
+| права на файлы | `root-ca.key`, `*.key.enc`, `network-cache.enc` → `0600` (задано) |
 
 ---
 
 ## 7. Диагностика
 
 ```bash
-# Проверить доступность мастера
+# Доступность мастера
 nc -vz 192.168.10.5 443
 nc -vz 192.168.10.5 8443
 
@@ -145,24 +164,42 @@ nc -vz 192.168.10.5 8443
 journalctl -u natssl-master -f
 journalctl -u natssl-client -f
 
-# Проверить установку Root CA в системе
-trust list | grep -A2 NATSSL          # RHEL family
-ls -l /usr/local/share/ca-certificates/natssl-root.crt  # Debian family
+# Root CA в системе
+trust list | grep -A2 NATSSL                              # RHEL family
+ls -l /usr/local/share/ca-certificates/natssl-root.crt    # Debian family
 
-# Проверить Root CA в Firefox-профиле
+# Root CA в Firefox-профиле
 certutil -L -d sql:$HOME/.mozilla/firefox/<profile> | grep NATSSL
+
+# Проверить выписанный клиентом сертификат
+openssl x509 -in /var/lib/natssl/issued/localhost.crt -noout -text | \
+  grep -A2 "Subject Alternative Name"
 ```
 
 ---
 
-## 8. FAQ
+## 8. Типовая ошибка: «issue failed: master is OFFLINE»
 
-**Почему нельзя «регенерировать» Root CA с тем же отпечатком без бэкапа?**
-SHA-256 fingerprint — хеш DER-кодирования сертификата, включающего подпись CA
-(недетерминированную для ECDSA). Единственный корректный способ — хранить
-оригинальный сертификат и ключ в зашифрованном recovery-кэше и восстанавливать
-их байт-в-байт. NATSSL делает именно так.
+Это **ожидаемое** поведение (ReadOnly). Клиент не может выписать новый
+сертификат, пока мастер недоступен. Варианты:
+
+1. Поднять мастер.
+2. Если мастер физически утрачен — выполнить `--promote-to-master`.
+3. Уже выданные сертификаты продолжают работать до конца срока.
+
+---
+
+## 9. FAQ
+
+**Почему клиент не подписывает сам?**
+Доверие построено на одном Root CA. Раздать его ключ на все машины =
+скомпрометировать всю сеть. CSR-flow: подпись централизована, приватный
+ключ листа остаётся у клиента.
 
 **Что если seed-фраза утеряна?**
-Восстановление невозможно — кэш расшифровать нечем. Это by design
-(zero-knowledge на стороне клиента).
+Восстановление невозможно — кэш расшифровать нечем. Это by design.
+
+**Почему нельзя регенерировать Root CA с тем же fingerprint без бэкапа?**
+SHA-256 fingerprint — хеш DER-кодирования (включая недетерминированную
+ECDSA-подпись). Корректно только восстановление байт-в-байт из
+зашифрованного recovery-кэша.

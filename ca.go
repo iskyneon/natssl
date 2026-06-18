@@ -119,13 +119,13 @@ func (ca *CA) KeyPKCS8() ([]byte, error) {
 // IssueResult — результат выдачи.
 type IssueResult struct {
 	CertPEM string
-	KeyPEM  string // присутствует для localhost-режима (генерим ключ сами)
+	KeyPEM  string // присутствует только когда ключ генерим мы (master --issue / localhost)
 	Cert    *x509.Certificate
 }
 
-// Issue выпускает leaf-сертификат на домены/IP.
-//   localhostMode=true  -> срок 1 год, флаг "Same PC only", генерируем ключ.
-//   localhostMode=false -> срок 90 дней (ACME-стиль), публичный домен/IP.
+// Issue выпускает leaf-сертификат на домены/IP (МАСТЕР генерирует и ключ, и сертификат).
+//   localhostMode=true  -> срок 1 год, флаг "Same PC only".
+//   localhostMode=false -> срок 90 дней (ACME-стиль).
 func (ca *CA) Issue(subject string, sans []string, localhostMode bool) (*IssueResult, error) {
 	dnsNames, ips := splitSANs(append([]string{subject}, sans...))
 	if !localhostMode && !validIssuanceTarget(dnsNames, ips) {
@@ -170,6 +170,52 @@ func (ca *CA) Issue(subject string, sans []string, localhostMode bool) (*IssueRe
 	keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
 
 	return &IssueResult{CertPEM: certPEM, KeyPEM: keyPEM, Cert: cert}, nil
+}
+
+// SignCSR подписывает CSR клиента. Приватный ключ листа МАСТЕРУ неизвестен —
+// он видит только публичный ключ внутри запроса. KeyPEM в результате пустой.
+func (ca *CA) SignCSR(csr *x509.CertificateRequest, localhostMode bool) (*IssueResult, error) {
+	if err := csr.CheckSignature(); err != nil {
+		return nil, fmt.Errorf("invalid CSR signature: %w", err)
+	}
+	dnsNames := csr.DNSNames
+	ips := csr.IPAddresses
+	notAfter := time.Now().AddDate(0, 0, 90)
+
+	if localhostMode {
+		// "Same PC only": разрешаем ТОЛЬКО loopback-имена и адреса.
+		for _, d := range dnsNames {
+			if d != "localhost" {
+				return nil, fmt.Errorf("localhost mode: only 'localhost' allowed, got %q", d)
+			}
+		}
+		for _, ip := range ips {
+			if !ip.IsLoopback() {
+				return nil, fmt.Errorf("localhost mode: only loopback IPs allowed, got %s", ip)
+			}
+		}
+		notAfter = time.Now().AddDate(1, 0, 0) // 1 год
+	} else if !validIssuanceTarget(dnsNames, ips) {
+		return nil, fmt.Errorf("CSR target not allowed for issuance: %v %v", dnsNames, ips)
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber: newSerial(),
+		Subject:      csr.Subject,
+		NotBefore:    time.Now().Add(-5 * time.Minute),
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:     dnsNames,
+		IPAddresses:  ips,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, csr.PublicKey, ca.Key)
+	if err != nil {
+		return nil, err
+	}
+	cert, _ := x509.ParseCertificate(der)
+	certPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	return &IssueResult{CertPEM: certPEM, Cert: cert}, nil // KeyPEM пустой
 }
 
 func splitSANs(items []string) (dns []string, ips []net.IP) {

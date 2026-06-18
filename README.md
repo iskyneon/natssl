@@ -17,6 +17,7 @@
 - [Требования](#требования)
 - [Сборка](#сборка)
 - [Быстрый старт](#быстрый-старт)
+- [Выпуск сертификата клиентом (CSR-flow)](#выпуск-сертификата-клиентом-csr-flow)
 - [Конфигурация](#конфигурация)
 - [Аварийное восстановление](#аварийное-восстановление)
 - [Безопасность](#безопасность)
@@ -28,11 +29,11 @@
 
 | Категория | Что умеет |
 |---|---|
-| **Master** | Bootstrap Root CA (10 лет), выпуск сертификатов, реплицируемый AES-GCM-256 кэш |
-| **Client** | Авто-установка Root CA в ОС и Firefox, ReadOnly-режим при падении мастера |
+| **Master** | Bootstrap Root CA (10 лет), выпуск сертификатов, подпись CSR, реплицируемый AES-GCM-256 кэш |
+| **Client** | Авто-установка Root CA в ОС и Firefox, **выпуск собственных сертификатов через CSR**, ReadOnly при падении мастера |
 | **DR** | 24-словная seed (BIP-39), promote-to-master с восстановлением *идентичного* fingerprint |
 | **Сеть** | IPv4/IPv6, статическое обнаружение, порты `443` (ACME) и `8443` (mTLS) |
-| **Локалхост** | Сертификаты на `127.0.0.1` сроком 1 год, режим *Same-PC only* |
+| **Локалхост** | Сертификаты на `127.0.0.1`/`::1`/`localhost` сроком 1 год, режим *Same-PC only*, ключ зашифрован паролем |
 
 ---
 
@@ -41,7 +42,7 @@
 ```
         ┌──────────────┐  443 ACME / 8443 mTLS   ┌──────────────┐
         │   MASTER      │ ───── issue / cache ───▶ │   CLIENT      │
-        │  Root CA      │                          │  Cert Store   │
+        │  Root CA      │ ◀──── CSR sign ───────── │  Cert Store   │
         │  SQLite       │ ◀──── pull (1h) ──────── │  (read-only   │
         │  recovery-pub │                          │   enc cache)  │
         └──────┬───────┘                          └──────┬───────┘
@@ -72,7 +73,7 @@
 ```bash
 # Кросс-компиляция amd64 + arm64
 make release
-# или
+# или без make:
 ./build.sh
 ```
 
@@ -85,7 +86,13 @@ dist/
 └── SHA256SUMS.txt
 ```
 
-Установка:
+Упаковать весь исходный код в архив:
+
+```bash
+./pack.sh     # -> natssl-src.tar.gz
+```
+
+Установка бинарника:
 
 ```bash
 tar -xzf natssl-1.0.0-oss-linux-amd64.tar.gz
@@ -105,7 +112,6 @@ sudo natssl --mode=master --bootstrap
 
 sudo systemctl enable --now natssl-master
 sudo natssl --mode=master --issue "app.internal"
-sudo natssl --mode=master --issue "127.0.0.1" --localhost
 ```
 
 ### Client
@@ -115,6 +121,62 @@ sudo natssl --mode=master --issue "127.0.0.1" --localhost
 ```bash
 sudo systemctl enable --now natssl-client
 ```
+
+---
+
+## Выпуск сертификата клиентом (CSR-flow)
+
+> **Кто может подписывать?** Только мастер (у него ключ Root CA).
+> **Где живёт приватный ключ листа?** Только на вашей машине — он генерируется
+> локально, в CSR уходит лишь публичная часть.
+
+### Сертификат на localhost / 127.0.0.1 (Same-PC only, 1 год)
+
+```bash
+sudo natssl --mode=client --issue "localhost" --localhost
+# ↳ утилита спросит пароль для шифрования приватного ключа
+```
+
+Результат:
+
+```
+✔ Certificate issued for "localhost"
+  cert: /var/lib/natssl/issued/localhost.crt
+  key : /var/lib/natssl/issued/localhost.key.enc  (encrypted, this PC only)
+```
+
+### Сертификат на внутренний домен/IP (90 дней)
+
+```bash
+sudo natssl --mode=client --issue "dev.internal"
+sudo natssl --mode=client --issue "192.168.10.42"
+```
+
+### Расшифровать приватный ключ для использования
+
+```bash
+natssl --mode=client \
+  --decrypt-key=/var/lib/natssl/issued/localhost.key.enc > /tmp/localhost.key
+chmod 600 /tmp/localhost.key
+```
+
+Подключение в dev-сервере (Go-пример):
+
+```go
+cert, _ := tls.LoadX509KeyPair(
+    "/var/lib/natssl/issued/localhost.crt",
+    "/tmp/localhost.key",
+)
+srv := &http.Server{
+    Addr:      ":8443",
+    TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+}
+```
+
+Браузер уже доверяет сертификату — Root CA установлен клиентом в ОС и Firefox.
+
+> ⚠️ Если мастер недоступен, выпуск новых сертификатов **блокируется**
+> (ReadOnly). Ранее выданные продолжают работать до конца срока.
 
 ---
 
@@ -161,11 +223,28 @@ sudo natssl --mode=client --promote-to-master \
 - Приватный recovery-ключ **никогда не пишется на диск** мастера.
 - Кэш сети зашифрован AES-GCM-256; симметричный ключ запечатан публичным
   recovery-ключом (NaCl SealedBox) → клиент не может расшифровать.
+- Приватный ключ клиентского сертификата **не покидает машину** (CSR-flow) и
+  хранится зашифрованным (scrypt N=2¹⁵ + AES-GCM-256) под паролем пользователя.
 - Пакет миграции подписывается ключом Root CA и верифицируется клиентами.
 
 > ⚠️ В OSS-версии транспорт раздачи кэша упрощён (`InsecureSkipVerify`).
 > Для production включите пиннинг Root CA и строгий mTLS — см. раздел
 > «Hardening» в `docs/DEPLOYMENT.md`.
+
+---
+
+## Полный список команд
+
+| Команда | Назначение |
+|---|---|
+| `natssl --mode=master --bootstrap` | Инициализация Root CA + seed-фраза |
+| `natssl --mode=master` | Запуск мастера (443 + 8443) |
+| `natssl --mode=master --issue "X" [--localhost]` | Выдача (ключ генерит мастер) |
+| `natssl --mode=client` | Запуск клиента (установка CA, пинг, приём кэша) |
+| `natssl --mode=client --issue "X" [--localhost]` | **Выписать себе** (CSR-flow) |
+| `natssl --mode=client --decrypt-key=FILE` | Расшифровать `.key.enc` в stdout |
+| `natssl --mode=client --promote-to-master --token="..."` | Аварийная активация |
+| `natssl --version` | Версия |
 
 ---
 

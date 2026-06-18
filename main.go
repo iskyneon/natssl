@@ -7,7 +7,11 @@ import (
 	"os"
 )
 
-const Version = "1.0.0-oss"
+var (
+	Version   = "1.0.0-oss"
+	Commit    = "nogit"
+	BuildDate = "unknown"
+)
 
 func main() {
 	var (
@@ -16,8 +20,9 @@ func main() {
 		promote    = flag.Bool("promote-to-master", false, "disaster-recovery promotion (client)")
 		token      = flag.String("token", "", "24-word BIP-39 recovery seed phrase")
 		configPath = flag.String("config", "/etc/natssl/config.yaml", "path to config.yaml")
-		issue      = flag.String("issue", "", "issue a certificate for the given domain/IP (master)")
+		issue      = flag.String("issue", "", "issue a certificate for the given domain/IP")
 		localhost  = flag.Bool("localhost", false, "issue a Same-PC-only localhost certificate")
+		decryptKey = flag.String("decrypt-key", "", "decrypt an encrypted private key (.key.enc) to stdout")
 		showVer    = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -26,7 +31,7 @@ func main() {
 	log.SetPrefix("[natssl] ")
 
 	if *showVer {
-		fmt.Println("NATSSL", Version)
+		fmt.Printf("NATSSL %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 		return
 	}
 
@@ -64,6 +69,19 @@ func main() {
 			}
 			if err := RunPromote(cfg, *token); err != nil {
 				log.Fatalf("PROMOTE BLOCKED: %v", err)
+			}
+			return
+		}
+		if *decryptKey != "" {
+			if err := RunDecryptKey(*decryptKey); err != nil {
+				log.Fatalf("decrypt failed: %v", err)
+			}
+			return
+		}
+		if *issue != "" {
+			// Клиент выписывает СЕБЕ сертификат через CSR-flow к мастеру.
+			if err := RunClientIssue(cfg, *issue, *localhost); err != nil {
+				log.Fatalf("issue failed: %v", err)
 			}
 			return
 		}

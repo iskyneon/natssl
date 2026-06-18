@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
@@ -108,6 +109,8 @@ func RunMaster(cfg *Config) error {
 	acmeMux.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, cfg.cachePath())
 	})
+
+	// Выдача с генерацией ключа на стороне мастера (ключ возвращается клиенту).
 	acmeMux.HandleFunc("/acme/new-order", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Subject   string   `json:"subject"`
@@ -135,6 +138,46 @@ func RunMaster(cfg *Config) error {
 		json.NewEncoder(w).Encode(map[string]string{
 			"certificate": res.CertPEM, "private_key": res.KeyPEM,
 		})
+	})
+
+	// Подпись CSR клиента: приватный ключ листа НИКОГДА не покидает клиента.
+	acmeMux.HandleFunc("/acme/sign-csr", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			CSR       string `json:"csr"`
+			ClientPub string `json:"client_pub"`
+			Localhost bool   `json:"localhost"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		block, _ := pem.Decode([]byte(req.CSR))
+		if block == nil {
+			http.Error(w, "bad CSR PEM", 400)
+			return
+		}
+		csr, err := x509.ParseCertificateRequest(block.Bytes)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		res, err := ca.SignCSR(csr, req.Localhost)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		subject := csr.Subject.CommonName
+		rec := CertRecord{
+			ID: res.Cert.SerialNumber.Text(16), Subject: subject,
+			SANs:      strings.Join(append(res.Cert.DNSNames, ipsToStr(res.Cert.IPAddresses)...), ","),
+			NotBefore: res.Cert.NotBefore, NotAfter: res.Cert.NotAfter,
+			ClientPub: req.ClientPub, SerialHex: res.Cert.SerialNumber.Text(16),
+			CertPEM: res.CertPEM,
+		}
+		st.AddCert(rec)
+		RebuildEncryptedCache(cfg, ca, st)
+		log.Printf("signed CSR for %q (serial %s)", subject, rec.SerialHex)
+		json.NewEncoder(w).Encode(map[string]string{"certificate": res.CertPEM})
 	})
 
 	// Push-генератор кэша: веерная рассылка раз в pull_interval.
@@ -188,9 +231,3 @@ func pushCacheToClients(cfg *Config, st *Store) {
 		url := fmt.Sprintf("https://%s:8443/cache/push", host(c))
 		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(string(data)))
 		req.Header.Set("Content-Type", "application/octet-stream")
-		if resp, err := client.Do(req); err == nil {
-			resp.Body.Close()
-			log.Printf("cache pushed to %s", c)
-		}
-	}
-}
