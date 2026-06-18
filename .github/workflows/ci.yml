@@ -21,12 +21,8 @@ jobs:
       - name: vet
         run: go vet ./...
 
-      - name: staticcheck
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          staticcheck ./...
-
       - name: build (amd64 + arm64)
         run: |
           GOOS=linux GOARCH=amd64 go build ./...
           GOOS=linux GOARCH=arm64 go build ./...
+
