@@ -429,5 +429,5 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
 
 ## License
 
-Apache-2.0 (OSS version). Clustering (Raft, N>1 masters) and per-client mTLS
+Apache-2.0 (OSS version).
 enrollment are part of the commercial edition.
