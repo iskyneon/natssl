@@ -76,8 +76,6 @@ Root CA.
 
 ---
 
----
-
 ## Download
 
 Pre-built binaries for **1.0.8** ([release page](https://github.com/iskyneon/natssl/releases/tag/1.0.8)):
@@ -98,8 +96,9 @@ natssl --version
 
 ---
 
-## Requirements
+## Build from source
 
+Requirements:
 - **Go 1.22+** (for building)
 - Linux: Ubuntu/Debian/CentOS/RHEL/Rocky
 - For Firefox integration: `certutil`
