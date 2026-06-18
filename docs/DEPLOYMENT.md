@@ -148,9 +148,9 @@ sudo natssl --mode=master --issue "*.internal"
 
 | Target | SAN entry | Validity |
 |---|---|---|
-| Domain with a dot | `DNS:<name>` | 90 days |
-| IPv4 / IPv6 | `IP Address:<ip>` | 90 days |
-| Wildcard | `DNS:*.<suffix>` | 90 days |
+| Domain with a dot | `DNS:<name>` | 1 year |
+| IPv4 / IPv6 | `IP Address:<ip>` | 1 year |
+| Wildcard | `DNS:*.<suffix>` | 1 year |
 | `--localhost` | `DNS:localhost` + loopback IPs | 1 year |
 
 Files land in `/var/lib/natssl/issued/<sanitized-target>.{crt,key}` (key `0600`),
@@ -260,7 +260,7 @@ openssl x509 -in /var/lib/natssl/issued/192.168.1.2.crt -noout -text | grep -A2 
 
 **Can I issue a certificate for an IP address?** Yes — on the master:
 `natssl --mode=master --issue "192.168.1.2"`. The IP goes into the SAN as
-`IP Address:`, valid 90 days. Clients cannot do this (loopback-only); it is an
+`IP Address:`, valid 1 year. Clients cannot do this (loopback-only); it is an
 administrator action.
 
 **Why is the Root CA never the TLS key?** A network-facing key is exposed to
