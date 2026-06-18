@@ -1,0 +1,12 @@
+mode: client
+data_dir: /var/lib/natssl
+listen:
+  acme: ":443"
+  mgmt: ":8443"
+master_address: "192.168.10.5"
+recovery_public_key: ""          # заполняется автоматически при bootstrap (мастер) / раздаётся клиентам
+clients:
+  - "192.168.10.20"
+  - "192.168.10.21"
+pull_interval: 1h
+ping_interval: 5m
