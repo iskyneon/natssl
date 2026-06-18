@@ -430,4 +430,3 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
 ## License
 
 Apache-2.0 (OSS version).
-enrollment are part of the commercial edition.
