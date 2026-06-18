@@ -7,7 +7,7 @@ Shipped as a single, lightweight binary, it functions as an enterprise Certifica
 while ensuring absolute infrastructure resilience.
 
 ![status](https://img.shields.io/badge/version-1.0.8--oss-blue)
-![platform](https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational)
+![platform](https://img.shields.io/badge/platform-linux--amd64%20%7C%20linux--arm64%20%7C%20darwin--amd64%20%7C%20darwin--arm64-informational)
 
 ---
 
