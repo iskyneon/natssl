@@ -30,38 +30,30 @@ no cloud.
 
 | Category | Capabilities |
 |---|---|
-| **Master** | Bootstrap Root CA (10y), issue certificates, sign CSRs, replicated AES-GCM-256 cache |
-| **Client** | Auto-install Root CA into OS and Firefox, **issue its own certificates via CSR**, ReadOnly mode when the master is down |
+| **Master** | Bootstrap Root CA (10y), issue any cert, sign loopback CSRs, replicated AES-GCM-256 cache |
+| **Client** | Auto-install Root CA into OS and Firefox, **issue loopback certs for itself**, ReadOnly mode when the master is down |
 | **DR** | 24-word seed (BIP-39), promote-to-master restoring the *identical* fingerprint |
 | **Network** | IPv4/IPv6, static discovery, ports `443` (ACME) and `8443` (mTLS) |
-| **Localhost** | Certificates for `127.0.0.1`/`::1`/`localhost` valid for 1 year, *Same-PC only*, private key encrypted with a password |
+| **Localhost** | Certificates for `127.0.0.1`/`::1`/`localhost` valid 1 year, *Same-PC only*, private key encrypted with a password |
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph M["MASTER"]
-        direction TB
-        RCA["Root CA"]
-        DB["SQLite"]
-        RPUB["recovery-pub"]
-    end
-
-    subgraph C["CLIENT"]
-        direction TB
-        CS["Cert Store"]
-        ENC["encrypted cache<br/>(read-only)"]
-    end
-
-    M -- "issue / cache (443)" --> C
-    C -- "CSR sign (443)" --> M
-    C -- "pull every 1h" --> M
-    M -- "push network-cache.enc (8443)" --> C
-
-    M -. "AES-GCM-256(snapshot)<br/>key sealed by recovery PUBLIC key" .-> CACHE["network-cache.enc<br/>stored as 'dead weight'"]
-    C -. "replicated" .-> CACHE
+```text
+        ┌───────────────────┐                          ┌───────────────────┐
+        │      MASTER        │   443 ACME / 8443 mTLS   │      CLIENT        │
+        │  ───────────────   │                          │  ───────────────  │
+        │  Root CA           │ ──── issue / cache ────▶ │  Cert Store       │
+        │  SQLite            │ ◀─── CSR sign ────────── │  (read-only)      │
+        │  recovery-pub      │ ◀─── pull (1h) ───────── │  encrypted cache  │
+        └─────────┬─────────┘                          └─────────┬─────────┘
+                  │                                              │
+                  │ AES-GCM-256(snapshot)                        │
+                  │ key sealed by recovery PUBLIC key            │
+                  ▼                                              ▼
+          network-cache.enc  ───────── replicated ────────▶  stored as
+                                                              "dead weight"
 ```
 
 On disaster, a client holding the seed phrase decrypts the cache and becomes
@@ -138,30 +130,42 @@ sudo systemctl enable --now natssl-client
 
 ## Issuing a Certificate as a Client (CSR-flow)
 
-> **Who can sign?** Only the master (it holds the Root CA key).
-> **Where does the leaf private key live?** Only on your machine — it is
-> generated locally; only the public part is sent inside the CSR.
+> **Hard rule:** a client can issue certificates **only for loopback**
+> (`localhost`, `127.0.0.1`, `::1`). Any other domain or IP is **rejected** —
+> both locally (before contacting the master) and on the master (HTTP 403).
+>
+> Certificates for real domains/IPs are issued **only by the administrator**
+> on the master via `natssl --mode=master --issue "..."`.
 
-### Certificate for localhost / 127.0.0.1 (Same-PC only, 1 year)
+| Requester | Allowed targets |
+|---|---|
+| **Client** (`--mode=client --issue`) | `localhost`, `127.0.0.1`, `::1` only |
+| **Admin** (`--mode=master --issue`) | any `*.internal` / `*.local` / IP / domain |
+
+The leaf private key is generated **locally** on the client and never leaves
+the machine; only the public part travels inside the CSR.
+
+### Allowed (client)
 
 ```bash
 sudo natssl --mode=client --issue "localhost" --localhost
+sudo natssl --mode=client --issue "127.0.0.1"
 # ↳ you will be prompted for a password to encrypt the private key
 ```
 
 Result:
 
 ```
-✔ Certificate issued for "localhost"
+✔ Loopback certificate issued for "localhost"
   cert: /var/lib/natssl/issued/localhost.crt
   key : /var/lib/natssl/issued/localhost.key.enc  (encrypted, this PC only)
 ```
 
-### Certificate for an internal domain/IP (90 days)
+### Rejected (client)
 
 ```bash
-sudo natssl --mode=client --issue "dev.internal"
-sudo natssl --mode=client --issue "192.168.10.42"
+sudo natssl --mode=client --issue "dev.internal"   # -> error: loopback only
+sudo natssl --mode=client --issue "192.168.10.20"  # -> error: loopback only
 ```
 
 ### Decrypt the private key for use
@@ -236,6 +240,9 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
 - The recovery private key is **never written to disk** on the master.
 - The network cache is encrypted with AES-GCM-256; the symmetric key is sealed
   with the recovery public key (NaCl SealedBox) → the client cannot decrypt it.
+- **Clients can only obtain loopback certificates** — enforced both client-side
+  and on the master (HTTP 403). This prevents a client from impersonating any
+  other host on the trusted network.
 - The client certificate's private key **never leaves the machine** (CSR-flow)
   and is stored encrypted (scrypt N=2¹⁵ + AES-GCM-256) under the user's password.
 - Migration packets are signed with the Root CA key and verified by clients.
@@ -252,9 +259,9 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
 |---|---|
 | `natssl --mode=master --bootstrap` | Initialize Root CA + seed phrase |
 | `natssl --mode=master` | Run the master (443 + 8443) |
-| `natssl --mode=master --issue "X" [--localhost]` | Issue (master generates the key) |
+| `natssl --mode=master --issue "X" [--localhost]` | Issue any cert (master generates the key) |
 | `natssl --mode=client` | Run the client (install CA, ping, receive cache) |
-| `natssl --mode=client --issue "X" [--localhost]` | **Issue for yourself** (CSR-flow) |
+| `natssl --mode=client --issue "localhost"` | **Issue a loopback cert for yourself** (CSR-flow) |
 | `natssl --mode=client --decrypt-key=FILE` | Decrypt a `.key.enc` to stdout |
 | `natssl --mode=client --promote-to-master --token="..."` | Disaster-recovery promotion |
 | `natssl --version` | Show version |
@@ -263,4 +270,5 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
 
 ## License
 
-Apache-2.0 (OSS version).
+Apache-2.0 (OSS version). Clustering (Raft, N>1 masters) is part of the
+commercial edition.

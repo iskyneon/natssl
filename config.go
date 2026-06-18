@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -8,31 +9,27 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Listen holds the two listening sockets used by the master.
 type Listen struct {
-	ACME string `yaml:"acme"` // :443
-	Mgmt string `yaml:"mgmt"` // :8443
+	ACME string `yaml:"acme"` // ACME-style issuance API, e.g. ":443"
+	Mgmt string `yaml:"mgmt"` // mTLS management/sync, e.g. ":8443"
 }
 
+// Config is the on-disk configuration shared by master and client modes.
 type Config struct {
-	path string `yaml:"-"`
+	Mode              string        `yaml:"mode"`                // master | client
+	DataDir           string        `yaml:"data_dir"`            // /var/lib/natssl
+	Listen            Listen        `yaml:"listen"`              // ports
+	MasterAddress     string        `yaml:"master_address"`      // client -> master host/IP
+	RecoveryPublicKey string        `yaml:"recovery_public_key"` // base64, auto-filled on bootstrap
+	Clients           []string      `yaml:"clients"`             // master push targets
+	PullInterval      time.Duration `yaml:"pull_interval"`       // cache pull/push cadence
+	PingInterval      time.Duration `yaml:"ping_interval"`       // master health-check cadence
 
-	Mode    string `yaml:"mode"`
-	DataDir string `yaml:"data_dir"`
-	Listen  Listen `yaml:"listen"`
-
-	// Адрес мастера (для клиентов и для проверки старого УЦ при promote).
-	MasterAddress string `yaml:"master_address"`
-
-	// Публичный recovery-ключ (base64). Раздаётся всем клиентам.
-	RecoveryPublicKey string `yaml:"recovery_public_key"`
-
-	// Известные клиенты (жёстко заданные IP/DNS — без mDNS).
-	Clients []string `yaml:"clients"`
-
-	PullInterval time.Duration `yaml:"pull_interval"` // 1h
-	PingInterval time.Duration `yaml:"ping_interval"` // 5m
+	path string `yaml:"-"` // source file path (not serialized)
 }
 
+// DefaultConfig returns a config with safe defaults.
 func DefaultConfig() *Config {
 	return &Config{
 		Mode:         "master",
@@ -43,6 +40,7 @@ func DefaultConfig() *Config {
 	}
 }
 
+// LoadConfig reads and validates the YAML config at path.
 func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -50,19 +48,33 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	c := DefaultConfig()
 	if err := yaml.Unmarshal(b, c); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	c.path = path
-	if c.PullInterval == 0 {
+
+	if c.DataDir == "" {
+		c.DataDir = "/var/lib/natssl"
+	}
+	if c.Listen.ACME == "" {
+		c.Listen.ACME = ":443"
+	}
+	if c.Listen.Mgmt == "" {
+		c.Listen.Mgmt = ":8443"
+	}
+	if c.PullInterval <= 0 {
 		c.PullInterval = time.Hour
 	}
-	if c.PingInterval == 0 {
+	if c.PingInterval <= 0 {
 		c.PingInterval = 5 * time.Minute
 	}
 	return c, nil
 }
 
+// Save writes the config back to its source path (creating parent dirs).
 func (c *Config) Save() error {
+	if c.path == "" {
+		c.path = "/etc/natssl/config.yaml"
+	}
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
 		return err
 	}
@@ -73,9 +85,10 @@ func (c *Config) Save() error {
 	return os.WriteFile(c.path, b, 0o644)
 }
 
-// Пути к артефактам.
-func (c *Config) caCertPath() string  { return filepath.Join(c.DataDir, "root-ca.crt") }
-func (c *Config) caKeyPath() string   { return filepath.Join(c.DataDir, "root-ca.key") }
-func (c *Config) dbPath() string      { return filepath.Join(c.DataDir, "natssl.db") }
-func (c *Config) cachePath() string   { return filepath.Join(c.DataDir, "network-cache.enc") }
-func (c *Config) issuedDir() string   { return filepath.Join(c.DataDir, "issued") }
+// --- derived paths -------------------------------------------------------
+
+func (c *Config) caCertPath() string { return filepath.Join(c.DataDir, "root-ca.crt") }
+func (c *Config) caKeyPath() string  { return filepath.Join(c.DataDir, "root-ca.key") }
+func (c *Config) dbPath() string     { return filepath.Join(c.DataDir, "natssl.db") }
+func (c *Config) cachePath() string  { return filepath.Join(c.DataDir, "network-cache.enc") }
+func (c *Config) issuedDir() string  { return filepath.Join(c.DataDir, "issued") }

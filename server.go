@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-// RebuildEncryptedCache: формирует снапшот, шифрует AES-GCM, ключ запечатывает recovery-pub.
+// RebuildEncryptedCache builds a snapshot, encrypts it with AES-GCM, and seals
+// the symmetric key with the recovery public key.
 func RebuildEncryptedCache(cfg *Config, ca *CA, st *Store) error {
 	pub, err := RecoveryPublicFromBase64(cfg.RecoveryPublicKey)
 	if err != nil {
@@ -34,6 +35,8 @@ func RebuildEncryptedCache(cfg *Config, ca *CA, st *Store) error {
 	return ec.WriteFile(cfg.cachePath())
 }
 
+// RunBootstrap initializes a brand-new Root CA (valid 10 years) and prints the
+// 24-word recovery seed exactly once.
 func RunBootstrap(cfg *Config) error {
 	if _, err := os.Stat(cfg.caCertPath()); err == nil {
 		return fmt.Errorf("Root CA already exists at %s — refusing to overwrite", cfg.caCertPath())
@@ -85,6 +88,31 @@ func RunBootstrap(cfg *Config) error {
 	return nil
 }
 
+// enforceLoopbackOnly is the HARD authorization rule for client-submitted CSRs:
+// clients may ONLY obtain loopback certificates (localhost / 127.0.0.1 / ::1).
+// Any domain or non-loopback IP is rejected. Period.
+func enforceLoopbackOnly(csr *x509.CertificateRequest, localhost bool) error {
+	if !localhost {
+		return fmt.Errorf("clients may only request localhost certificates " +
+			"(use --localhost); domain/IP issuance is reserved for the administrator on the master")
+	}
+	for _, d := range csr.DNSNames {
+		if d != "localhost" {
+			return fmt.Errorf("clients may only request 'localhost', got DNS SAN %q", d)
+		}
+	}
+	for _, ip := range csr.IPAddresses {
+		if !ip.IsLoopback() {
+			return fmt.Errorf("clients may only request loopback IPs (127.0.0.1/::1), got %s", ip)
+		}
+	}
+	if len(csr.DNSNames) == 0 && len(csr.IPAddresses) == 0 {
+		return fmt.Errorf("CSR has no loopback SAN")
+	}
+	return nil
+}
+
+// RunMaster starts the master: ACME API on :443 and mTLS management on :8443.
 func RunMaster(cfg *Config) error {
 	ca, err := LoadCA(cfg.caCertPath(), cfg.caKeyPath())
 	if err != nil {
@@ -98,7 +126,7 @@ func RunMaster(cfg *Config) error {
 
 	log.Printf("master online | fingerprint %s", ca.Fingerprint())
 
-	// Порт 443 — ACME-совместимый REST API выдачи.
+	// Port 443 — ACME-compatible issuance API.
 	acmeMux := http.NewServeMux()
 	acmeMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
@@ -110,7 +138,7 @@ func RunMaster(cfg *Config) error {
 		http.ServeFile(w, r, cfg.cachePath())
 	})
 
-	// Выдача с генерацией ключа на стороне мастера (ключ возвращается клиенту).
+	// Issuance where the master generates the key (admin-style; returns key).
 	acmeMux.HandleFunc("/acme/new-order", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Subject   string   `json:"subject"`
@@ -140,7 +168,8 @@ func RunMaster(cfg *Config) error {
 		})
 	})
 
-	// Подпись CSR клиента: приватный ключ листа НИКОГДА не покидает клиента.
+	// CSR signing for clients. The leaf private key NEVER reaches the master.
+	// HARD RULE: clients get loopback-only certificates.
 	acmeMux.HandleFunc("/acme/sign-csr", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			CSR       string `json:"csr"`
@@ -161,6 +190,15 @@ func RunMaster(cfg *Config) error {
 			http.Error(w, err.Error(), 400)
 			return
 		}
+
+		// ── HARD AUTHORIZATION: clients = loopback only ────────────────
+		if err := enforceLoopbackOnly(csr, req.Localhost); err != nil {
+			log.Printf("DENIED CSR from %s: %v", r.RemoteAddr, err)
+			http.Error(w, err.Error(), 403)
+			return
+		}
+		// ───────────────────────────────────────────────────────────────
+
 		res, err := ca.SignCSR(csr, req.Localhost)
 		if err != nil {
 			http.Error(w, err.Error(), 400)
@@ -176,11 +214,11 @@ func RunMaster(cfg *Config) error {
 		}
 		st.AddCert(rec)
 		RebuildEncryptedCache(cfg, ca, st)
-		log.Printf("signed CSR for %q (serial %s)", subject, rec.SerialHex)
+		log.Printf("signed loopback CSR for %q (serial %s)", subject, rec.SerialHex)
 		json.NewEncoder(w).Encode(map[string]string{"certificate": res.CertPEM})
 	})
 
-	// Push-генератор кэша: веерная рассылка раз в pull_interval.
+	// Periodic cache fan-out to clients.
 	go func() {
 		t := time.NewTicker(cfg.PullInterval)
 		defer t.Stop()
@@ -195,7 +233,7 @@ func RunMaster(cfg *Config) error {
 		log.Fatal(srv.ListenAndServeTLS(cfg.caCertPath(), cfg.caKeyPath()))
 	}()
 
-	// Порт 8443 — внутреннее управление/синхронизация (mTLS).
+	// Port 8443 — internal management/sync (mTLS).
 	mgmtMux := http.NewServeMux()
 	mgmtMux.HandleFunc("/sync/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
@@ -226,8 +264,14 @@ func pushCacheToClients(cfg *Config, st *Store) {
 	if err != nil {
 		return
 	}
-	client := insecureMasterClient() // клиент доверяет нашему Root CA
+	client := insecureMasterClient() // client trusts our Root CA
 	for _, c := range cls {
 		url := fmt.Sprintf("https://%s:8443/cache/push", host(c))
 		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(string(data)))
 		req.Header.Set("Content-Type", "application/octet-stream")
+		if resp, err := client.Do(req); err == nil {
+			resp.Body.Close()
+			log.Printf("cache pushed to %s", c)
+		}
+	}
+}
