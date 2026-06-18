@@ -13,6 +13,33 @@ var (
 	BuildDate = "unknown"
 )
 
+func usage() {
+	fmt.Fprintf(os.Stderr, `NATSSL %s — Zero-Configuration Distributed TLS for Private Infrastructure
+
+USAGE:
+  natssl --mode=master [flags]
+  natssl --mode=client [flags]
+
+MASTER MODE:
+  --mode=master --bootstrap          Initialize a new Root CA (10y) and print the 24-word seed once
+  --mode=master                      Run the master (ACME API on :443, mTLS management on :8443)
+  --mode=master --issue "<target>"   Issue a certificate; the master generates the private key
+                                     Add --localhost for a Same-PC-only localhost cert (1 year)
+
+CLIENT MODE:
+  --mode=client                      Run the client (install Root CA, ping master, receive cache)
+  --mode=client --issue "<target>"   Issue a certificate for yourself via CSR-flow
+                                     (private key is generated locally and never leaves this machine)
+                                     Add --localhost for a Same-PC-only localhost cert (1 year)
+  --mode=client --decrypt-key=FILE   Decrypt an encrypted private key (.key.enc) to stdout
+  --mode=client --promote-to-master --token="<24 words>"
+                                     Disaster-recovery promotion of this client into a new master
+
+FLAGS:
+`, Version)
+	flag.PrintDefaults()
+}
+
 func main() {
 	var (
 		mode       = flag.String("mode", "", "operation mode: master | client")
@@ -21,10 +48,11 @@ func main() {
 		token      = flag.String("token", "", "24-word BIP-39 recovery seed phrase")
 		configPath = flag.String("config", "/etc/natssl/config.yaml", "path to config.yaml")
 		issue      = flag.String("issue", "", "issue a certificate for the given domain/IP")
-		localhost  = flag.Bool("localhost", false, "issue a Same-PC-only localhost certificate")
+		localhost  = flag.Bool("localhost", false, "issue a Same-PC-only localhost certificate (1 year)")
 		decryptKey = flag.String("decrypt-key", "", "decrypt an encrypted private key (.key.enc) to stdout")
 		showVer    = flag.Bool("version", false, "print version and exit")
 	)
+	flag.Usage = usage
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
@@ -79,7 +107,7 @@ func main() {
 			return
 		}
 		if *issue != "" {
-			// Клиент выписывает СЕБЕ сертификат через CSR-flow к мастеру.
+			// The client issues a certificate for itself via the CSR-flow.
 			if err := RunClientIssue(cfg, *issue, *localhost); err != nil {
 				log.Fatalf("issue failed: %v", err)
 			}
@@ -90,8 +118,7 @@ func main() {
 		}
 
 	default:
-		fmt.Fprintln(os.Stderr, "usage: natssl --mode=master|client [flags]")
-		flag.PrintDefaults()
+		usage()
 		os.Exit(2)
 	}
 }

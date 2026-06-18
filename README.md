@@ -2,42 +2,43 @@
 
 **Zero-Configuration Distributed TLS for Private Infrastructure.**
 
-Единый бинарник — Центр Сертификации (Root CA) для приватных сетей с
-аварийным восстановлением по 24-словной seed-фразе (BIP-39), без mDNS и
-без облака.
+A single binary acting as a Certificate Authority (Root CA) for private
+networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
+no cloud.
 
 ![status](https://img.shields.io/badge/version-1.0.0--oss-blue)
 ![platform](https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational)
 
 ---
 
-## Содержание
-- [Возможности](#возможности)
-- [Архитектура](#архитектура)
-- [Требования](#требования)
-- [Сборка](#сборка)
-- [Быстрый старт](#быстрый-старт)
-- [Выпуск сертификата клиентом (CSR-flow)](#выпуск-сертификата-клиентом-csr-flow)
-- [Конфигурация](#конфигурация)
-- [Аварийное восстановление](#аварийное-восстановление)
-- [Безопасность](#безопасность)
-- [Лицензия](#лицензия)
+## Table of Contents
+- [Features](#features)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Building](#building)
+- [Quick Start](#quick-start)
+- [Issuing a Certificate as a Client (CSR-flow)](#issuing-a-certificate-as-a-client-csr-flow)
+- [Configuration](#configuration)
+- [Disaster Recovery](#disaster-recovery)
+- [Security](#security)
+- [Command Reference](#command-reference)
+- [License](#license)
 
 ---
 
-## Возможности
+## Features
 
-| Категория | Что умеет |
+| Category | Capabilities |
 |---|---|
-| **Master** | Bootstrap Root CA (10 лет), выпуск сертификатов, подпись CSR, реплицируемый AES-GCM-256 кэш |
-| **Client** | Авто-установка Root CA в ОС и Firefox, **выпуск собственных сертификатов через CSR**, ReadOnly при падении мастера |
-| **DR** | 24-словная seed (BIP-39), promote-to-master с восстановлением *идентичного* fingerprint |
-| **Сеть** | IPv4/IPv6, статическое обнаружение, порты `443` (ACME) и `8443` (mTLS) |
-| **Локалхост** | Сертификаты на `127.0.0.1`/`::1`/`localhost` сроком 1 год, режим *Same-PC only*, ключ зашифрован паролем |
+| **Master** | Bootstrap Root CA (10y), issue certificates, sign CSRs, replicated AES-GCM-256 cache |
+| **Client** | Auto-install Root CA into OS and Firefox, **issue its own certificates via CSR**, ReadOnly mode when the master is down |
+| **DR** | 24-word seed (BIP-39), promote-to-master restoring the *identical* fingerprint |
+| **Network** | IPv4/IPv6, static discovery, ports `443` (ACME) and `8443` (mTLS) |
+| **Localhost** | Certificates for `127.0.0.1`/`::1`/`localhost` valid for 1 year, *Same-PC only*, private key encrypted with a password |
 
 ---
 
-## Архитектура
+## Architecture
 
 ```
         ┌──────────────┐  443 ACME / 8443 mTLS   ┌──────────────┐
@@ -49,35 +50,36 @@
                │ AES-GCM-256(snapshot)                    │
                │ key sealed by recovery PUBLIC key        │
                ▼                                          ▼
-        network-cache.enc  ───────── реплицируется ─────▶ хранится
-                                                          «мёртвым грузом»
+        network-cache.enc  ───────── replicated ────────▶ stored as
+                                                          "dead weight"
 ```
 
-При катастрофе клиент с seed-фразой расшифровывает кэш и становится мастером
-**с тем же серийным номером и SHA-256 отпечатком** Root CA.
+On disaster, a client holding the seed phrase decrypts the cache and becomes
+the master **with the same serial number and SHA-256 fingerprint** of the
+Root CA.
 
 ---
 
-## Требования
+## Requirements
 
-- **Go 1.22+** (для сборки)
+- **Go 1.22+** (for building)
 - Linux: Ubuntu/Debian/CentOS/RHEL/Rocky
-- Для интеграции с Firefox: `certutil`
+- For Firefox integration: `certutil`
   - Debian/Ubuntu: `apt-get install libnss3-tools`
   - RHEL/Rocky/CentOS: `dnf install nss-tools`
 
 ---
 
-## Сборка
+## Building
 
 ```bash
-# Кросс-компиляция amd64 + arm64
+# Cross-compile for amd64 + arm64
 make release
-# или без make:
+# or without make:
 ./build.sh
 ```
 
-Результат:
+Output:
 
 ```
 dist/
@@ -86,13 +88,13 @@ dist/
 └── SHA256SUMS.txt
 ```
 
-Упаковать весь исходный код в архив:
+Pack the entire source tree into an archive:
 
 ```bash
 ./pack.sh     # -> natssl-src.tar.gz
 ```
 
-Установка бинарника:
+Install the binary:
 
 ```bash
 tar -xzf natssl-1.0.0-oss-linux-amd64.tar.gz
@@ -102,13 +104,13 @@ natssl --version
 
 ---
 
-## Быстрый старт
+## Quick Start
 
 ### Master
 
 ```bash
 sudo natssl --mode=master --bootstrap
-# Запишите 24 слова OFFLINE — они показываются ОДИН раз!
+# Write down the 24 words OFFLINE — they are shown only ONCE!
 
 sudo systemctl enable --now natssl-master
 sudo natssl --mode=master --issue "app.internal"
@@ -116,7 +118,7 @@ sudo natssl --mode=master --issue "app.internal"
 
 ### Client
 
-Скопируйте `recovery_public_key` и `master_address` в `/etc/natssl/config.yaml`:
+Copy `recovery_public_key` and `master_address` into `/etc/natssl/config.yaml`:
 
 ```bash
 sudo systemctl enable --now natssl-client
@@ -124,20 +126,20 @@ sudo systemctl enable --now natssl-client
 
 ---
 
-## Выпуск сертификата клиентом (CSR-flow)
+## Issuing a Certificate as a Client (CSR-flow)
 
-> **Кто может подписывать?** Только мастер (у него ключ Root CA).
-> **Где живёт приватный ключ листа?** Только на вашей машине — он генерируется
-> локально, в CSR уходит лишь публичная часть.
+> **Who can sign?** Only the master (it holds the Root CA key).
+> **Where does the leaf private key live?** Only on your machine — it is
+> generated locally; only the public part is sent inside the CSR.
 
-### Сертификат на localhost / 127.0.0.1 (Same-PC only, 1 год)
+### Certificate for localhost / 127.0.0.1 (Same-PC only, 1 year)
 
 ```bash
 sudo natssl --mode=client --issue "localhost" --localhost
-# ↳ утилита спросит пароль для шифрования приватного ключа
+# ↳ you will be prompted for a password to encrypt the private key
 ```
 
-Результат:
+Result:
 
 ```
 ✔ Certificate issued for "localhost"
@@ -145,14 +147,14 @@ sudo natssl --mode=client --issue "localhost" --localhost
   key : /var/lib/natssl/issued/localhost.key.enc  (encrypted, this PC only)
 ```
 
-### Сертификат на внутренний домен/IP (90 дней)
+### Certificate for an internal domain/IP (90 days)
 
 ```bash
 sudo natssl --mode=client --issue "dev.internal"
 sudo natssl --mode=client --issue "192.168.10.42"
 ```
 
-### Расшифровать приватный ключ для использования
+### Decrypt the private key for use
 
 ```bash
 natssl --mode=client \
@@ -160,7 +162,7 @@ natssl --mode=client \
 chmod 600 /tmp/localhost.key
 ```
 
-Подключение в dev-сервере (Go-пример):
+Use it in a dev server (Go example):
 
 ```go
 cert, _ := tls.LoadX509KeyPair(
@@ -173,14 +175,15 @@ srv := &http.Server{
 }
 ```
 
-Браузер уже доверяет сертификату — Root CA установлен клиентом в ОС и Firefox.
+The browser already trusts the certificate — the Root CA was installed by the
+client into the OS and Firefox.
 
-> ⚠️ Если мастер недоступен, выпуск новых сертификатов **блокируется**
-> (ReadOnly). Ранее выданные продолжают работать до конца срока.
+> ⚠️ If the master is unreachable, issuing new certificates is **blocked**
+> (ReadOnly). Previously issued certificates keep working until they expire.
 
 ---
 
-## Конфигурация
+## Configuration
 
 `/etc/natssl/config.yaml`:
 
@@ -191,7 +194,7 @@ listen:
   acme: ":443"
   mgmt: ":8443"
 master_address: "192.168.10.5"
-recovery_public_key: ""    # авто-заполняется на мастере при bootstrap
+recovery_public_key: ""    # auto-filled on the master during bootstrap
 clients:
   - "192.168.10.20"
   - "192.168.10.21"
@@ -201,53 +204,53 @@ ping_interval: 5m
 
 ---
 
-## Аварийное восстановление
+## Disaster Recovery
 
 ```bash
 sudo natssl --mode=client --promote-to-master \
   --token="word1 word2 ... word24"
 ```
 
-Перед активацией выполняется **«цепочка соуса»**:
+A mandatory **safety chain** runs before activation:
 
-1. TCP health-check старого мастера (`443`/`8443`) → жив → **abort**.
-2. ICMP + ARP (`/proc/net/arp`) → отвечает → **block**.
-3. Конфликт локального IP со старым → **block**.
+1. TCP health-check of the old master (`443`/`8443`) → alive → **abort**.
+2. ICMP + ARP (`/proc/net/arp`) → responds → **block**.
+3. Local IP conflict with the old master → **block**.
 
-Подробнее — см. [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
-
----
-
-## Безопасность
-
-- Приватный recovery-ключ **никогда не пишется на диск** мастера.
-- Кэш сети зашифрован AES-GCM-256; симметричный ключ запечатан публичным
-  recovery-ключом (NaCl SealedBox) → клиент не может расшифровать.
-- Приватный ключ клиентского сертификата **не покидает машину** (CSR-flow) и
-  хранится зашифрованным (scrypt N=2¹⁵ + AES-GCM-256) под паролем пользователя.
-- Пакет миграции подписывается ключом Root CA и верифицируется клиентами.
-
-> ⚠️ В OSS-версии транспорт раздачи кэша упрощён (`InsecureSkipVerify`).
-> Для production включите пиннинг Root CA и строгий mTLS — см. раздел
-> «Hardening» в `docs/DEPLOYMENT.md`.
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
 
 ---
 
-## Полный список команд
+## Security
 
-| Команда | Назначение |
+- The recovery private key is **never written to disk** on the master.
+- The network cache is encrypted with AES-GCM-256; the symmetric key is sealed
+  with the recovery public key (NaCl SealedBox) → the client cannot decrypt it.
+- The client certificate's private key **never leaves the machine** (CSR-flow)
+  and is stored encrypted (scrypt N=2¹⁵ + AES-GCM-256) under the user's password.
+- Migration packets are signed with the Root CA key and verified by clients.
+
+> ⚠️ In the OSS version the cache-distribution transport is simplified
+> (`InsecureSkipVerify`). For production, enable Root CA pinning and strict
+> mTLS — see the "Hardening" section in `docs/DEPLOYMENT.md`.
+
+---
+
+## Command Reference
+
+| Command | Purpose |
 |---|---|
-| `natssl --mode=master --bootstrap` | Инициализация Root CA + seed-фраза |
-| `natssl --mode=master` | Запуск мастера (443 + 8443) |
-| `natssl --mode=master --issue "X" [--localhost]` | Выдача (ключ генерит мастер) |
-| `natssl --mode=client` | Запуск клиента (установка CA, пинг, приём кэша) |
-| `natssl --mode=client --issue "X" [--localhost]` | **Выписать себе** (CSR-flow) |
-| `natssl --mode=client --decrypt-key=FILE` | Расшифровать `.key.enc` в stdout |
-| `natssl --mode=client --promote-to-master --token="..."` | Аварийная активация |
-| `natssl --version` | Версия |
+| `natssl --mode=master --bootstrap` | Initialize Root CA + seed phrase |
+| `natssl --mode=master` | Run the master (443 + 8443) |
+| `natssl --mode=master --issue "X" [--localhost]` | Issue (master generates the key) |
+| `natssl --mode=client` | Run the client (install CA, ping, receive cache) |
+| `natssl --mode=client --issue "X" [--localhost]` | **Issue for yourself** (CSR-flow) |
+| `natssl --mode=client --decrypt-key=FILE` | Decrypt a `.key.enc` to stdout |
+| `natssl --mode=client --promote-to-master --token="..."` | Disaster-recovery promotion |
+| `natssl --version` | Show version |
 
 ---
 
-## Лицензия
+## License
 
-Apache-2.0 (OSS-версия). Кластеризация (Raft, N>1 мастеров) — в коммерческой версии.
+Apache-2.0 (OSS version).
