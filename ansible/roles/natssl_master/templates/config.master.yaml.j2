@@ -1,0 +1,13 @@
+mode: master
+data_dir: {{ natssl_data_dir }}
+listen:
+  acme: "{{ natssl_acme_listen }}"
+  mgmt: "{{ natssl_mgmt_listen }}"
+recovery_public_key: "{{ natssl_recovery_public_key | default('') }}"
+enrollment_token: "{{ natssl_enrollment_token }}"
+client_networks:
+{% for cidr in natssl_client_networks %}
+  - "{{ cidr }}"
+{% endfor %}
+pull_interval: {{ natssl_pull_interval }}
+

@@ -1,0 +1,8 @@
+mode: client
+data_dir: {{ natssl_data_dir }}
+master_address: "{{ natssl_master_address }}"
+master_fingerprint: "{{ hostvars[_master].natssl_master_fingerprint }}"
+recovery_public_key: "{{ hostvars[_master].natssl_recovery_public_key }}"
+enrollment_token: "{{ natssl_enrollment_token }}"
+ping_interval: {{ natssl_ping_interval }}
+

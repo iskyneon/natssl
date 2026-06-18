@@ -1,0 +1,4 @@
+---
+# ansible-vault encrypt group_vars/vault.yml
+# Сгенерируй один раз:  openssl rand -hex 32
+natssl_enrollment_token: "ЗАМЕНИ_НА_openssl_rand_hex_32"

@@ -1,0 +1,22 @@
+---
+# --- Релиз 1.0.8 (имена ассетов как на GitHub Releases) ---
+natssl_release_tag: "1.0.8"
+natssl_pkg_version: "1.0.8-oss"
+natssl_download_base: "https://github.com/iskyneon/natssl/releases/download"
+
+# --- Пути (совпадают с systemd-юнитами и config.*.yaml) ---
+natssl_bin: "/usr/local/bin/natssl"
+natssl_conf_dir: "/etc/natssl"
+natssl_conf_file: "/etc/natssl/config.yaml"
+natssl_data_dir: "/var/lib/natssl"
+
+# --- Сеть/интервалы ---
+natssl_acme_listen: ":443"
+natssl_mgmt_listen: ":8443"
+natssl_pull_interval: "1h"
+natssl_ping_interval: "5m"
+
+# Подсети, из которых клиентам разрешён self-enroll
+natssl_client_networks:
+  - "192.168.10.0/24"
+

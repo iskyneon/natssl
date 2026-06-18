@@ -1,0 +1,74 @@
+---
+# Сохраняем recovery_public_key, если bootstrap уже был (чтобы шаблон его не затёр)
+- name: Check if master config already exists
+  ansible.builtin.stat:
+    path: "{{ natssl_conf_file }}"
+  register: master_cfg_stat
+
+- name: Pre-read existing recovery_public_key (preserve across re-runs)
+  ansible.builtin.slurp:
+    src: "{{ natssl_conf_file }}"
+  register: master_cfg_pre
+  when: master_cfg_stat.stat.exists
+
+- name: Set recovery_public_key fact (empty on first run)
+  ansible.builtin.set_fact:
+    natssl_recovery_public_key: >-
+      {{ (master_cfg_pre.content | b64decode
+          | regex_search('recovery_public_key:\s*"?([^"\n]*)', '\1') | first)
+         if master_cfg_stat.stat.exists else '' }}
+
+- name: Render master config.yaml
+  ansible.builtin.template:
+    src: config.master.yaml.j2
+    dest: "{{ natssl_conf_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: restart natssl-master
+
+- name: Install master systemd unit
+  ansible.builtin.template:
+    src: natssl-master.service.j2
+    dest: /etc/systemd/system/natssl-master.service
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart natssl-master
+
+# --- Bootstrap: ОДИН раз. creates: гарантирует идемпотентность ---
+- name: Bootstrap Root CA (prints 24-word seed + fingerprint ONCE)
+  ansible.builtin.command:
+    cmd: "{{ natssl_bin }} --mode=master --bootstrap --config={{ natssl_conf_file }}"
+    creates: "{{ natssl_data_dir }}/root-ca.crt"
+  register: natssl_bootstrap
+
+- name: ">>> RECORD THIS 24-WORD SEED OFFLINE NOW (shown only once) <<<"
+  ansible.builtin.debug:
+    msg: "{{ natssl_bootstrap.stdout_lines }}"
+  when: natssl_bootstrap is changed
+
+- name: Enable & start master
+  ansible.builtin.systemd:
+    name: natssl-master
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# --- Экспорт значений для клиентов ---
+- name: Read Root CA SHA-256 fingerprint
+  ansible.builtin.command: >-
+    openssl x509 -in {{ natssl_data_dir }}/root-ca.crt -noout -fingerprint -sha256
+  register: rootca_fp
+  changed_when: false
+
+- name: Re-read recovery_public_key (now filled by bootstrap)
+  ansible.builtin.slurp:
+    src: "{{ natssl_conf_file }}"
+  register: master_cfg_post
+
+- name: Publish master facts (consumed by clients via hostvars)
+  ansible.builtin.set_fact:
+    natssl_master_fingerprint: "{{ rootca_fp.stdout.split('=')[1] | trim }}"
+    natssl_recovery_public_key: "{{ master_cfg_post.content | b64decode
+        | regex_search('recovery_public_key:\\s*\"?([^\"\\n]*)', '\\1') | first }}"

@@ -1,0 +1,22 @@
+---
+# 1) Бинарник + каталоги + зависимости на всех хостах
+- name: NATSSL — common provisioning
+  hosts: natssl_master:natssl_clients
+  become: true
+  roles:
+    - natssl_common
+
+# 2) Мастер: config -> bootstrap -> service -> экспорт fingerprint + recovery_public_key
+- name: NATSSL — master
+  hosts: natssl_master
+  become: true
+  roles:
+    - natssl_master
+
+# 3) Клиенты: используют факты, собранные на мастере (hostvars), затем enroll
+- name: NATSSL — clients
+  hosts: natssl_clients
+  become: true
+  roles:
+    - natssl_client
+

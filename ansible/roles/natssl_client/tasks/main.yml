@@ -1,0 +1,37 @@
+---
+- name: Resolve master host & address
+  ansible.builtin.set_fact:
+    _master: "{{ groups['natssl_master'][0] }}"
+
+- name: Compute master_address (override with natssl_master_address)
+  ansible.builtin.set_fact:
+    natssl_master_address: >-
+      {{ natssl_master_address
+         | default(hostvars[_master].ansible_host
+                   | default(hostvars[_master].ansible_default_ipv4.address)) }}
+
+- name: Render client config.yaml (pins fingerprint + token + recovery key from master)
+  ansible.builtin.template:
+    src: config.client.yaml.j2
+    dest: "{{ natssl_conf_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: restart natssl-client
+
+- name: Install client systemd unit
+  ansible.builtin.template:
+    src: natssl-client.service.j2
+    dest: /etc/systemd/system/natssl-client.service
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart natssl-client
+
+- name: Enable & start client (installs CA, enrolls, pulls)
+  ansible.builtin.systemd:
+    name: natssl-client
+    enabled: true
+    state: started
+    daemon_reload: true
+

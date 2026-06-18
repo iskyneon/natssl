@@ -1,0 +1,50 @@
+---
+- name: Map Ansible arch -> Go arch
+  ansible.builtin.set_fact:
+    natssl_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_architecture] }}"
+
+- name: Ensure config dir
+  ansible.builtin.file:
+    path: "{{ natssl_conf_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: Ensure data dir (CA keys + sqlite)
+  ansible.builtin.file:
+    path: "{{ natssl_data_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Install certutil (Firefox/NSS integration)
+  ansible.builtin.package:
+    name: "{{ 'libnss3-tools' if ansible_os_family == 'Debian' else 'nss-tools' }}"
+    state: present
+
+- name: Check installed natssl version
+  ansible.builtin.command: "{{ natssl_bin }} --version"
+  register: natssl_have
+  changed_when: false
+  failed_when: false
+
+- name: Download + install natssl {{ natssl_pkg_version }}
+  when: natssl_pkg_version not in (natssl_have.stdout | default(''))
+  block:
+    - name: Download release tarball
+      ansible.builtin.get_url:
+        url: "{{ natssl_download_base }}/{{ natssl_release_tag }}/natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}.tar.gz"
+        dest: "/tmp/natssl-{{ natssl_pkg_version }}-{{ natssl_arch }}.tar.gz"
+        mode: "0644"
+
+    - name: Unpack
+      ansible.builtin.unarchive:
+        src: "/tmp/natssl-{{ natssl_pkg_version }}-{{ natssl_arch }}.tar.gz"
+        dest: /tmp/
+        remote_src: true
+
+    - name: Install binary to {{ natssl_bin }}
+      ansible.builtin.copy:
+        src: "/tmp/natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}"
+        dest: "{{ natssl_bin }}"
+        remote_src: true
+        mode: "0755"
+

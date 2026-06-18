@@ -1,0 +1,6 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd: { daemon_reload: true }
+- name: restart natssl-client
+  ansible.builtin.systemd: { name: natssl-client, state: restarted }
+
