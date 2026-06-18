@@ -2,9 +2,9 @@
 
 **Zero-Configuration Distributed TLS for Private Infrastructure.**
 
-A single binary acting as a Certificate Authority (Root CA) for private
-networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
-no cloud.
+NATSSL is a zero-configuration distributed TLS solution built for private infrastructure. 
+Shipped as a single, lightweight binary, it functions as an enterprise Certificate Authority (Root CA) 
+while ensuring absolute infrastructure resilience.
 
 ![status](https://img.shields.io/badge/version-1.0.8--oss-blue)
 ![platform](https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational)

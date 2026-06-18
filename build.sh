@@ -19,7 +19,7 @@ LDFLAGS="-s -w \
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-PLATFORMS=("linux amd64" "linux arm64")
+PLATFORMS=("linux amd64" "linux arm64" "darwin amd64" "darwin arm64")
 
 for p in "${PLATFORMS[@]}"; do
   read -r GOOS GOARCH <<<"$p"
