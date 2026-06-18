@@ -7,36 +7,44 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 )
 
-const systemRootCAPath = "/usr/local/share/ca-certificates/natssl-root.crt"
+const (
+	debianRootCAPath = "/usr/local/share/ca-certificates/natssl-root.crt"
+	rhelRootCAPath   = "/etc/pki/ca-trust/source/anchors/natssl-root.crt"
+)
 
-// InstallRootCA: импорт в системное хранилище + Firefox.
-func InstallRootCA(pemBytes []byte) error {
+// InstallRootCAIntoOS installs the Root CA (read from certPath) into the system
+// trust store (Debian/Ubuntu and RHEL/Rocky/CentOS).
+func InstallRootCAIntoOS(certPath string) error {
 	if os.Geteuid() != 0 {
-		return fmt.Errorf("root privileges required to install CA")
+		return fmt.Errorf("root privileges required to install CA into the OS trust store")
 	}
-	if err := os.WriteFile(systemRootCAPath, pemBytes, 0o644); err != nil {
+	pemBytes, err := os.ReadFile(certPath)
+	if err != nil {
 		return err
 	}
-	if err := exec.Command("update-ca-certificates").Run(); err != nil {
-		// RHEL/CentOS/Rocky: иной путь и команда
-		_ = os.WriteFile("/etc/pki/ca-trust/source/anchors/natssl-root.crt", pemBytes, 0o644)
-		if err2 := exec.Command("update-ca-trust", "extract").Run(); err2 != nil {
-			return fmt.Errorf("update-ca-certificates: %v; update-ca-trust: %v", err, err2)
+	// Debian/Ubuntu first.
+	if err := os.WriteFile(debianRootCAPath, pemBytes, 0o644); err == nil {
+		if err := exec.Command("update-ca-certificates").Run(); err == nil {
+			return nil
 		}
 	}
-	if err := installIntoFirefox(); err != nil {
-		fmt.Printf("[natssl] WARN firefox: %v\n", err)
+	// RHEL family fallback.
+	if err := os.WriteFile(rhelRootCAPath, pemBytes, 0o644); err != nil {
+		return fmt.Errorf("write RHEL anchor: %w", err)
+	}
+	if err := exec.Command("update-ca-trust", "extract").Run(); err != nil {
+		return fmt.Errorf("update-ca-trust: %w", err)
 	}
 	return nil
 }
 
-// installIntoFirefox: ищет профили и внедряет Root CA через certutil.
-func installIntoFirefox() error {
+// InstallRootCAIntoFirefox imports the Root CA into every discovered Firefox
+// profile via certutil (libnss3-tools / nss-tools).
+func InstallRootCAIntoFirefox(certPath string) error {
 	if _, err := exec.LookPath("certutil"); err != nil {
-		return fmt.Errorf("certutil (libnss3-tools) not installed")
+		return fmt.Errorf("certutil (libnss3-tools/nss-tools) not installed")
 	}
 	var roots []string
 	for _, h := range homeDirs() {
@@ -62,7 +70,7 @@ func installIntoFirefox() error {
 			cmd := exec.Command("certutil", "-A",
 				"-n", "NATSSL Private Root CA",
 				"-t", "CT,C,C",
-				"-i", systemRootCAPath,
+				"-i", certPath,
 				"-d", "sql:"+profile,
 			)
 			if out, err := cmd.CombinedOutput(); err != nil {
@@ -85,14 +93,16 @@ func homeDirs() []string {
 			}
 		}
 	}
-	dirs = append(dirs, "/root")
-	return dirs
+	return append(dirs, "/root")
 }
 
 func LoadInstalledRootCA() (*x509.Certificate, error) {
-	b, err := os.ReadFile(systemRootCAPath)
+	b, err := os.ReadFile(debianRootCAPath)
 	if err != nil {
-		return nil, err
+		b, err = os.ReadFile(rhelRootCAPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	blk, _ := pem.Decode(b)
 	if blk == nil {
@@ -100,5 +110,3 @@ func LoadInstalledRootCA() (*x509.Certificate, error) {
 	}
 	return x509.ParseCertificate(blk.Bytes)
 }
-
-func init() { _ = strings.TrimSpace } // keep import

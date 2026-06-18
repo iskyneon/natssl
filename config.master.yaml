@@ -1,8 +1,10 @@
 mode: master
 data_dir: /var/lib/natssl
+listen:
+  acme: ":443"
+  mgmt: ":8443"
 recovery_public_key: ""          # auto-filled on bootstrap
-enrollment_token: "REPLACE_ME"   # openssl rand -hex 32
+enrollment_token: "REPLACE_ME"   # REQUIRED: openssl rand -hex 32
 client_networks:
   - "192.168.10.0/24"
-  - "10.0.0.0/16"
 pull_interval: 1h

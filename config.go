@@ -12,8 +12,8 @@ import (
 
 // Listen holds the two listening sockets used by the master.
 type Listen struct {
-	ACME string `yaml:"acme"` // ACME-style issuance API, e.g. ":443"
-	Mgmt string `yaml:"mgmt"` // mTLS management/sync, e.g. ":8443"
+	ACME string `yaml:"acme"` // bootstrap API, e.g. ":443"
+	Mgmt string `yaml:"mgmt"` // mTLS control plane, e.g. ":8443"
 }
 
 // Config is the on-disk configuration shared by master and client modes.
@@ -26,9 +26,9 @@ type Config struct {
 	RecoveryPublicKey string        `yaml:"recovery_public_key"` // base64, auto-filled on bootstrap
 	EnrollmentToken   string        `yaml:"enrollment_token"`    // shared secret for /acme/register
 	ClientNetworks    []string      `yaml:"client_networks"`     // master: CIDRs allowed to self-register
-	Clients           []string      `yaml:"clients"`             // optional static push targets (fallback)
-	PullInterval      time.Duration `yaml:"pull_interval"`       // cache pull/push cadence
-	PingInterval      time.Duration `yaml:"ping_interval"`       // master health-check cadence
+	Clients           []string      `yaml:"clients"`             // optional static targets (fallback)
+	PullInterval      time.Duration `yaml:"pull_interval"`       // cache pull cadence
+	PingInterval      time.Duration `yaml:"ping_interval"`       // re-registration cadence
 
 	path string `yaml:"-"` // source file path (not serialized)
 }
@@ -72,11 +72,17 @@ func LoadConfig(path string) (*Config, error) {
 		c.PingInterval = 5 * time.Minute
 	}
 
-	// Validate CIDRs early so misconfiguration fails loudly on the master.
 	for _, cidr := range c.ClientNetworks {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return nil, fmt.Errorf("invalid client_networks entry %q: %w", cidr, err)
 		}
+	}
+
+	// Fail-closed: a master that enables self-registration MUST require a
+	// token; otherwise authorization degrades to spoofable CIDR-only.
+	if c.Mode == "master" && len(c.ClientNetworks) > 0 && c.EnrollmentToken == "" {
+		return nil, fmt.Errorf("client_networks is set but enrollment_token is empty: " +
+			"refuse to enable spoofable CIDR-only registration (openssl rand -hex 32)")
 	}
 	return c, nil
 }
@@ -97,7 +103,6 @@ func (c *Config) Save() error {
 }
 
 // ClientAllowed reports whether a peer IP is permitted to self-register.
-// A peer is allowed if its IP falls inside any configured client_networks CIDR.
 func (c *Config) ClientAllowed(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
@@ -118,3 +123,16 @@ func (c *Config) caKeyPath() string  { return filepath.Join(c.DataDir, "root-ca.
 func (c *Config) dbPath() string     { return filepath.Join(c.DataDir, "natssl.db") }
 func (c *Config) cachePath() string  { return filepath.Join(c.DataDir, "network-cache.enc") }
 func (c *Config) issuedDir() string  { return filepath.Join(c.DataDir, "issued") }
+
+// Dedicated server leaf (issued by the CA) so the TLS listeners never use the
+// Root CA private key directly.
+func (c *Config) serverCertPath() string { return filepath.Join(c.DataDir, "server.crt") }
+func (c *Config) serverKeyPath() string  { return filepath.Join(c.DataDir, "server.key") }
+
+// Per-client mTLS identity obtained at enrollment.
+func (c *Config) clientCertPath() string { return filepath.Join(c.DataDir, "client-identity.crt") }
+func (c *Config) clientKeyPath() string  { return filepath.Join(c.DataDir, "client-identity.key") }
+
+// Monotonic cache version manifest + local revocation list.
+func (c *Config) cacheVersionPath() string { return filepath.Join(c.DataDir, "cache.version") }
+func (c *Config) crlPath() string          { return filepath.Join(c.DataDir, "revoked.json") }

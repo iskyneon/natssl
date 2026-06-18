@@ -2,9 +2,7 @@ package main
 
 import (
 	"crypto/ecdsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
@@ -21,19 +19,19 @@ func RunPromote(cfg *Config, mnemonic string) error {
 		return fmt.Errorf("no old master address in config")
 	}
 
-	// --- ПРОВЕРКА 1: живучесть старого УЦ (TCP 443/8443). ---
+	// CHECK 1: liveness of the old master (TCP 443/8443).
 	log.Printf("check 1/3: TCP health of old master %s", oldIP)
 	if tcpHealthy(oldIP, 3*time.Second, 443) || tcpHealthy(oldIP, 3*time.Second, 8443) {
 		return fmt.Errorf("OLD MASTER IS ALIVE (443/8443 responds) — promotion aborted to prevent split-brain")
 	}
 
-	// --- ПРОВЕРКА 2: L2/L3 — ICMP ping + ARP-таблица. ---
+	// CHECK 2: L2/L3 — ICMP ping + ARP table.
 	log.Printf("check 2/3: ICMP/ARP reachability of %s", oldIP)
 	if icmpAlive(oldIP) || arpKnown(oldIP) {
-		return fmt.Errorf("old master IP %s answers at network layer (ICMP/ARP) — promotion blocked", oldIP)
+		return fmt.Errorf("old master IP %s answers at the network layer (ICMP/ARP) — promotion blocked", oldIP)
 	}
 
-	// --- ПРОВЕРКА 3: конфликт собственного IP. ---
+	// CHECK 3: own IP conflict.
 	log.Printf("check 3/3: local IP conflict check")
 	myIPs, err := localIPv4s()
 	if err != nil {
@@ -46,12 +44,11 @@ func RunPromote(cfg *Config, mnemonic string) error {
 	}
 	log.Printf("all safety checks passed")
 
-	// --- Восстановление recovery-ключа из сид-фразы. ---
+	// Reconstruct the recovery key and verify against the pinned public key.
 	rk, err := RecoveryFromMnemonic(strings.TrimSpace(mnemonic))
 	if err != nil {
 		return err
 	}
-	// Сверка с локально вшитым публичным ключом.
 	cfgPub, err := RecoveryPublicFromBase64(cfg.RecoveryPublicKey)
 	if err != nil {
 		return fmt.Errorf("config has no recovery public key: %w", err)
@@ -59,9 +56,9 @@ func RunPromote(cfg *Config, mnemonic string) error {
 	if rk.Public != *cfgPub {
 		return fmt.Errorf("seed phrase does not match the network's recovery public key")
 	}
-	log.Printf("recovery key reconstructed and verified against pinned public key")
+	log.Printf("recovery key reconstructed and verified against the pinned public key")
 
-	// --- Расшифровка локального кэша и восстановление БД. ---
+	// Decrypt the local cache and parse the snapshot.
 	ec, err := ReadEncryptedCache(cfg.cachePath())
 	if err != nil {
 		return fmt.Errorf("no local network cache to recover from: %w", err)
@@ -74,30 +71,42 @@ func RunPromote(cfg *Config, mnemonic string) error {
 	if err := json.Unmarshal(plain, &snap); err != nil {
 		return err
 	}
-	log.Printf("cache decrypted: %d certificates, %d clients", len(snap.Certificates), len(snap.Clients))
+	log.Printf("cache decrypted: snapshot v%d, %d certificates, %d clients",
+		snap.Version, len(snap.Certs), len(snap.Clients))
 
-	// --- Восстановление Root CA БАЙТ-В-БАЙТ (идентичный serial и SHA-256). ---
+	// Restore the Root CA byte-for-byte (identical serial & SHA-256).
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
-	caCert, _ := x509.ParseCertificate(snap.CACertDER)
-	keyAny, _ := x509.ParsePKCS8PrivateKey(snap.CAKeyPKCS8)
-	ca := &CA{Cert: caCert, CertDER: snap.CACertDER, Key: keyAny.(*ecdsa.PrivateKey)}
+	ca, err := LoadCAFromPEM(snap.CACertPEM, snap.CAKeyPEM)
+	if err != nil {
+		return fmt.Errorf("rebuild CA from snapshot: %w", err)
+	}
+
+	// Integrity gate: restored fingerprint MUST equal the pinned one.
+	if want := normalizeFingerprint(cfg.MasterFingerprint); want != "" {
+		if normalizeFingerprint(ca.Fingerprint()) != want {
+			return fmt.Errorf("restored CA fingerprint mismatch — refusing to promote")
+		}
+	}
 	if err := ca.SaveToFiles(cfg.caCertPath(), cfg.caKeyPath()); err != nil {
+		return err
+	}
+	if err := ensureServerCert(cfg, ca); err != nil {
 		return err
 	}
 	log.Printf("Root CA restored | identical fingerprint: %s", ca.Fingerprint())
 
+	// Transactionally restore the database.
 	st, err := OpenStore(cfg.dbPath())
 	if err != nil {
 		return err
 	}
 	if err := st.RestoreSnapshot(&snap); err != nil {
 		st.Close()
-		return err
+		return fmt.Errorf("restore snapshot: %w", err)
 	}
 
-	// --- Переключение конфигурации в режим master на НОВОМ IP. ---
 	newIP := myIPs[0]
 	cfg.Mode = "master"
 	cfg.MasterAddress = newIP
@@ -106,9 +115,11 @@ func RunPromote(cfg *Config, mnemonic string) error {
 		st.Close()
 		return err
 	}
-	RebuildEncryptedCache(cfg, ca, st)
+	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
+		st.Close()
+		return err
+	}
 
-	// --- Веерная P2P-рассылка пакета миграции, подписанного Root CA. ---
 	log.Printf("broadcasting signed migration packet (new master = %s) to %d clients",
 		newIP, len(snap.Clients))
 	broadcastMigration(ca, newIP, snap.Clients)
@@ -145,6 +156,3 @@ func broadcastMigration(ca *CA, newIP string, clients []string) {
 		}
 	}
 }
-
-// удобный re-export для подписи
-func pemDecodeFirst(b []byte) *pem.Block { blk, _ := pem.Decode(b); return blk }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -9,25 +10,32 @@ import (
 	"time"
 )
 
-// RegisterWithMaster announces this client to the master so it gets added to
-// the push list automatically. Authorization on the master is by enrollment
-// token (anti-spoofing) AND source-IP CIDR. The connection is pinned to the
-// master's Root CA. Idempotent.
-func RegisterWithMaster(cfg *Config) error {
+// buildRegisterRequest creates a POST to /acme/register carrying the enrollment
+// token. Body is caller-provided ({} for liveness, or {"csr":...} for enroll).
+func buildRegisterRequest(cfg *Config, body []byte) (*http.Request, error) {
 	if cfg.MasterAddress == "" {
-		return fmt.Errorf("master_address is empty; cannot self-register")
+		return nil, fmt.Errorf("master_address is empty; cannot self-register")
 	}
 	url := fmt.Sprintf("https://%s:443/acme/register", host(cfg.MasterAddress))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Enrollment-Token", cfg.EnrollmentToken)
+	return req, nil
+}
 
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader("{}"))
+// RegisterWithMaster re-announces liveness (and lazily enrolls if no identity
+// exists yet). Idempotent. Pinned transport.
+func RegisterWithMaster(cfg *Config) error {
+	if err := ensureClientIdentity(cfg); err != nil {
+		return err
+	}
+	req, err := buildRegisterRequest(cfg, []byte("{}"))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if cfg.EnrollmentToken != "" {
-		req.Header.Set("X-Enrollment-Token", cfg.EnrollmentToken)
-	}
-
 	resp, err := pinnedMasterClient(cfg).Do(req)
 	if err != nil {
 		return err
@@ -41,8 +49,8 @@ func RegisterWithMaster(cfg *Config) error {
 	return nil
 }
 
-// StartRegistrationLoop registers immediately and then re-registers
-// periodically so the client survives a master restart / DB reset.
+// StartRegistrationLoop re-registers periodically so the client survives a
+// master restart / DB reset.
 func StartRegistrationLoop(cfg *Config) {
 	go func() {
 		attempt := func() {
@@ -52,7 +60,7 @@ func StartRegistrationLoop(cfg *Config) {
 				log.Printf("self-registration with master %s OK", cfg.MasterAddress)
 			}
 		}
-		attempt() // immediate
+		attempt()
 		t := time.NewTicker(cfg.PingInterval)
 		defer t.Stop()
 		for range t.C {

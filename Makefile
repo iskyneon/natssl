@@ -1,13 +1,19 @@
-VERSION ?= 1.0.0-oss
+VERSION ?= 1.0.7-oss
+COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
+DATE    := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BINARY  := natssl
 OUT     := dist
 
 # Pure-Go SQLite (modernc.org/sqlite): keep CGO off for clean cross-compile.
 export CGO_ENABLED=0
 
-LDFLAGS := -s -w -X main.version=$(VERSION)
+# Capitalized names: package main uses Version / Commit / BuildDate.
+LDFLAGS := -s -w \
+  -X main.Version=$(VERSION) \
+  -X main.Commit=$(COMMIT) \
+  -X main.BuildDate=$(DATE)
 
-.PHONY: all build release clean test tidy vet fmt run-master run-client pack
+.PHONY: all build release clean test tidy vet staticcheck fmt run-master run-client pack ci
 
 all: build
 
@@ -23,9 +29,9 @@ release:
 pack:
 	./pack.sh
 
-## test: run unit tests
+## test: run unit tests (race detector on)
 test:
-	go test ./...
+	go test -race ./...
 
 ## tidy: sync go.mod / go.sum
 tidy:
@@ -34,6 +40,15 @@ tidy:
 ## vet: static checks
 vet:
 	go vet ./...
+
+## staticcheck: deeper linting (installed on demand)
+staticcheck:
+	@command -v staticcheck >/dev/null 2>&1 || go install honnef.co/go/tools/cmd/staticcheck@latest
+	staticcheck ./...
+
+## ci: the full gate run locally (mirrors .github/workflows/ci.yml)
+ci: tidy vet staticcheck test
+	@git diff --exit-code go.mod go.sum
 
 ## fmt: format all sources
 fmt:

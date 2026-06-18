@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	Version   = "1.0.0-oss"
+	Version   = "1.0.7-oss"
 	Commit    = "nogit"
 	BuildDate = "unknown"
 )
@@ -22,15 +22,14 @@ USAGE:
 
 MASTER MODE:
   --mode=master --bootstrap          Initialize a new Root CA (10y) and print the 24-word seed once
-  --mode=master                      Run the master (ACME API on :443, mTLS management on :8443)
-  --mode=master --issue "<target>"   Issue a certificate; the master generates the private key
+  --mode=master                      Run the master (bootstrap API :443, mTLS control plane :8443)
+  --mode=master --issue "<target>"   Issue a certificate locally (CLI-only; the master generates the key)
                                      Add --localhost for a Same-PC-only localhost cert (1 year)
+  --mode=master --revoke "<serial>"  Revoke a certificate by its hex serial
 
 CLIENT MODE:
-  --mode=client                      Run the client (install Root CA, ping master, receive cache)
-  --mode=client --issue "<target>"   Issue a certificate for yourself via CSR-flow
-                                     (private key is generated locally and never leaves this machine)
-                                     Add --localhost for a Same-PC-only localhost cert (1 year)
+  --mode=client                      Run the client (install Root CA, enroll, pull cache over mTLS)
+  --mode=client --issue "<target>"   Issue a LOOPBACK cert for yourself via CSR-flow over mTLS
   --mode=client --decrypt-key=FILE   Decrypt an encrypted private key (.key.enc) to stdout
   --mode=client --promote-to-master --token="<24 words>"
                                      Disaster-recovery promotion of this client into a new master
@@ -48,6 +47,7 @@ func main() {
 		token      = flag.String("token", "", "24-word BIP-39 recovery seed phrase")
 		configPath = flag.String("config", "/etc/natssl/config.yaml", "path to config.yaml")
 		issue      = flag.String("issue", "", "issue a certificate for the given domain/IP")
+		revoke     = flag.String("revoke", "", "revoke a certificate by hex serial (master)")
 		localhost  = flag.Bool("localhost", false, "issue a Same-PC-only localhost certificate (1 year)")
 		decryptKey = flag.String("decrypt-key", "", "decrypt an encrypted private key (.key.enc) to stdout")
 		showVer    = flag.Bool("version", false, "print version and exit")
@@ -80,6 +80,12 @@ func main() {
 			}
 			return
 		}
+		if *revoke != "" {
+			if err := RunRevoke(cfg, *revoke); err != nil {
+				log.Fatalf("revoke failed: %v", err)
+			}
+			return
+		}
 		if *issue != "" {
 			if err := RunIssueCLI(cfg, *issue, *localhost); err != nil {
 				log.Fatalf("issue failed: %v", err)
@@ -101,13 +107,12 @@ func main() {
 			return
 		}
 		if *decryptKey != "" {
-			if err := RunDecryptKey(*decryptKey); err != nil {
+			if err := RunDecryptKey(cfg, *decryptKey); err != nil {
 				log.Fatalf("decrypt failed: %v", err)
 			}
 			return
 		}
 		if *issue != "" {
-			// The client issues a certificate for itself via the CSR-flow.
 			if err := RunClientIssue(cfg, *issue, *localhost); err != nil {
 				log.Fatalf("issue failed: %v", err)
 			}

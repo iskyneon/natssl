@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -15,13 +16,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// RunClient boots the client: refresh + install the Root CA, self-register with
-// the master, accept replicated cache pushes on :8443, and periodically pull
-// the cache. New certificate issuance is handled separately (RunClientIssue)
-// and is loopback-only.
+// RunClient boots the client: install the Root CA (pinned), enroll for an mTLS
+// identity, accept signed migration packets on :8443, and pull the encrypted
+// cache over mTLS. There is NO inbound cache-push surface.
 func RunClient(cfg *Config) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
@@ -29,33 +31,30 @@ func RunClient(cfg *Config) error {
 	if cfg.MasterAddress == "" {
 		return fmt.Errorf("master_address is required in client mode")
 	}
+	if cfg.EnrollmentToken == "" {
+		return fmt.Errorf("enrollment_token is required in client mode")
+	}
 	if cfg.MasterFingerprint == "" {
-		log.Printf("WARNING: master_fingerprint not set — the first /ca fetch cannot be pinned; " +
-			"set it from the master bootstrap output for full protection")
+		log.Printf("WARNING: master_fingerprint not set — the bootstrap /ca fetch cannot be " +
+			"pinned to a known root; set it from the master bootstrap output")
 	}
 
 	log.Printf("client starting | master=%s", cfg.MasterAddress)
 
-	// 1. Fetch the Root CA from the master (pinned) and install it.
 	if err := fetchAndInstallRootCA(cfg); err != nil {
 		log.Printf("WARNING: could not install Root CA yet: %v (will retry on pull)", err)
 	}
+	if err := ensureClientIdentity(cfg); err != nil {
+		log.Printf("WARNING: enrollment incomplete: %v (will retry)", err)
+	}
 
-	// 2. Self-register with the master (idempotent, retried on PingInterval).
-	StartRegistrationLoop(cfg)
-
-	// 3. Accept cache pushes from the master on :8443.
-	go runCacheReceiver(cfg)
-
-	// 4. Periodically pull the cache (and refresh the Root CA) as a fallback.
+	StartRegistrationLoop(cfg) // periodic liveness re-announce
+	go runMigrationReceiver(cfg)
 	go runPullLoop(cfg)
 
-	// 5. Block forever.
 	select {}
 }
 
-// fetchAndInstallRootCA downloads the Root CA from the master over a pinned
-// connection and installs it into the OS + Firefox trust stores.
 func fetchAndInstallRootCA(cfg *Config) error {
 	url := fmt.Sprintf("https://%s:443/ca", host(cfg.MasterAddress))
 	resp, err := pinnedMasterClient(cfg).Get(url)
@@ -66,15 +65,13 @@ func fetchAndInstallRootCA(cfg *Config) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("master returned %d for /ca", resp.StatusCode)
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(cfg.caCertPath(), data, 0o644); err != nil {
+	if err := writeFileAtomic(cfg.caCertPath(), data, 0o644); err != nil {
 		return err
 	}
-
-	// Trust-store integration (see install.go).
 	if err := InstallRootCAIntoOS(cfg.caCertPath()); err != nil {
 		log.Printf("OS trust store: %v", err)
 	}
@@ -85,51 +82,115 @@ func fetchAndInstallRootCA(cfg *Config) error {
 	return nil
 }
 
-// runCacheReceiver serves :8443 to accept replicated cache pushes.
-func runCacheReceiver(cfg *Config) {
+// ensureClientIdentity enrolls (token + CIDR on master) and stores the returned
+// client-auth certificate, giving this client an mTLS identity. Idempotent.
+func ensureClientIdentity(cfg *Config) error {
+	if _, err := os.Stat(cfg.clientCertPath()); err == nil {
+		if _, e := os.Stat(cfg.clientKeyPath()); e == nil {
+			return nil
+		}
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader,
+		&x509.CertificateRequest{Subject: pkix.Name{CommonName: "natssl-client"}}, key)
+	if err != nil {
+		return err
+	}
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+	body, _ := json.Marshal(map[string]string{"csr": string(csrPEM)})
+	req, err := buildRegisterRequest(cfg, body)
+	if err != nil {
+		return err
+	}
+	resp, err := pinnedMasterClient(cfg).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("enroll rejected (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		ClientCertificate string `json:"client_certificate"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return err
+	}
+	if out.ClientCertificate == "" {
+		return fmt.Errorf("master returned no client certificate")
+	}
+	keyDER, _ := x509.MarshalPKCS8PrivateKey(key)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if err := writeFileAtomic(cfg.clientKeyPath(), keyPEM, 0o600); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(cfg.clientCertPath(), []byte(out.ClientCertificate), 0o644); err != nil {
+		return err
+	}
+	log.Printf("client mTLS identity stored")
+	return nil
+}
+
+// runMigrationReceiver serves :8443 to accept signed disaster-recovery
+// migration packets. The payload is verified against the Root CA public key.
+func runMigrationReceiver(cfg *Config) {
 	cert, err := ephemeralSelfSigned()
 	if err != nil {
-		log.Fatalf("cache receiver: cannot create ephemeral cert: %v", err)
+		log.Fatalf("migration receiver: cannot create ephemeral cert: %v", err)
 	}
-
 	mux := http.NewServeMux()
-	mux.HandleFunc("/cache/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/cache/push", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cache/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	mux.HandleFunc("/migrate", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
+		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+		var pkt MigrationPacket
+		if err := json.NewDecoder(r.Body).Decode(&pkt); err != nil {
+			http.Error(w, "bad packet", http.StatusBadRequest)
 			return
 		}
-		if err := os.WriteFile(cfg.cachePath(), data, 0o600); err != nil {
-			http.Error(w, err.Error(), 500)
+		if err := verifyMigrationSig(cfg, &pkt); err != nil {
+			log.Printf("AUDIT DENIED migration packet: %v", err)
+			http.Error(w, "invalid signature", http.StatusForbidden)
 			return
 		}
-		log.Printf("cache received from master (%d bytes)", len(data))
+		newIP := host(pkt.NewMasterIP)
+		if newIP == "" {
+			http.Error(w, "empty new master IP", http.StatusBadRequest)
+			return
+		}
+		cfg.MasterAddress = newIP
+		if err := cfg.Save(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("AUDIT migration accepted: new master = %s", newIP)
 		w.Write([]byte("ok"))
 	})
 
 	srv := &http.Server{
-		Addr:    cfg.Listen.Mgmt, // :8443
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		},
+		Addr:              cfg.Listen.Mgmt,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		TLSConfig:         &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
 	}
-	log.Printf("cache receiver on %s", cfg.Listen.Mgmt)
+	log.Printf("migration receiver on %s", cfg.Listen.Mgmt)
 	if err := srv.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("cache receiver failed: %v", err)
+		log.Fatalf("migration receiver failed: %v", err)
 	}
 }
 
-// runPullLoop periodically pulls the encrypted cache from the master (pinned)
-// and refreshes the Root CA. This is the fallback path when push is missed.
+// runPullLoop pulls the encrypted cache + CRL over mTLS, rejecting stale or
+// replayed versions via the monotonic X-Cache-Version header.
 func runPullLoop(cfg *Config) {
 	pull := func() {
 		if _, err := os.Stat(cfg.caCertPath()); err != nil {
@@ -137,8 +198,19 @@ func runPullLoop(cfg *Config) {
 				log.Printf("pull: Root CA refresh failed: %v", e)
 			}
 		}
-		url := fmt.Sprintf("https://%s:443/cache", host(cfg.MasterAddress))
-		resp, err := pinnedMasterClient(cfg).Get(url)
+		if _, err := os.Stat(cfg.clientCertPath()); err != nil {
+			if e := ensureClientIdentity(cfg); e != nil {
+				log.Printf("pull: no mTLS identity yet: %v", e)
+				return
+			}
+		}
+		client, err := mtlsClient(cfg)
+		if err != nil {
+			log.Printf("pull: %v", err)
+			return
+		}
+		url := fmt.Sprintf("https://%s:8443/sync/cache", host(cfg.MasterAddress))
+		resp, err := client.Get(url)
 		if err != nil {
 			log.Printf("pull: master unreachable (READ-ONLY): %v", err)
 			return
@@ -148,18 +220,26 @@ func runPullLoop(cfg *Config) {
 			log.Printf("pull: master returned %d", resp.StatusCode)
 			return
 		}
-		data, err := io.ReadAll(resp.Body)
+		newVer, _ := strconv.ParseInt(strings.TrimSpace(resp.Header.Get("X-Cache-Version")), 10, 64)
+		if cur := readLocalCacheVersion(cfg); newVer != 0 && newVer < cur {
+			log.Printf("pull: rejecting stale cache v%d (have v%d)", newVer, cur)
+			return
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		if err != nil {
 			return
 		}
-		if err := os.WriteFile(cfg.cachePath(), data, 0o600); err != nil {
+		if err := writeFileAtomic(cfg.cachePath(), data, 0o600); err != nil {
 			log.Printf("pull: cannot write cache: %v", err)
 			return
 		}
-		log.Printf("cache pulled from master (%d bytes)", len(data))
+		if newVer != 0 {
+			writeFileAtomic(cfg.cacheVersionPath(), []byte(strconv.FormatInt(newVer, 10)), 0o644)
+		}
+		log.Printf("cache pulled (v%d, %d bytes)", newVer, len(data))
+		fetchCRL(cfg, client)
 	}
-
-	pull() // immediate
+	pull()
 	t := time.NewTicker(cfg.PullInterval)
 	defer t.Stop()
 	for range t.C {
@@ -167,8 +247,36 @@ func runPullLoop(cfg *Config) {
 	}
 }
 
+func fetchCRL(cfg *Config, client *http.Client) {
+	url := fmt.Sprintf("https://%s:8443/sync/crl", host(cfg.MasterAddress))
+	resp, err := client.Get(url)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return
+	}
+	if err := writeFileAtomic(cfg.crlPath(), data, 0o644); err == nil {
+		log.Printf("revocation list updated")
+	}
+}
+
+func readLocalCacheVersion(cfg *Config) int64 {
+	b, err := os.ReadFile(cfg.cacheVersionPath())
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	return v
+}
+
 // ephemeralSelfSigned creates a short-lived self-signed cert for the :8443
-// receiver. It is not part of the PKI trust chain.
+// migration receiver. It is not part of the PKI trust chain.
 func ephemeralSelfSigned() (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

@@ -6,7 +6,7 @@ A single binary acting as a Certificate Authority (Root CA) for private
 networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
 no cloud.
 
-![status](https://img.shields.io/badge/version-1.0.0--oss-blue)
+![status](https://img.shields.io/badge/version-1.0.7--oss-blue)
 ![platform](https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational)
 
 ---
@@ -20,6 +20,7 @@ no cloud.
 - [Security Model](#security-model)
 - [Client Auto-Registration](#client-auto-registration)
 - [Issuing a Certificate as a Client (CSR-flow)](#issuing-a-certificate-as-a-client-csr-flow)
+- [Revocation](#revocation)
 - [Configuration](#configuration)
 - [Disaster Recovery](#disaster-recovery)
 - [Command Reference](#command-reference)
@@ -31,13 +32,13 @@ no cloud.
 
 | Category | Capabilities |
 |---|---|
-| **Master** | Bootstrap Root CA (10y), issue any cert, sign loopback CSRs, replicated AES-GCM-256 cache |
-| **Client** | Auto-install Root CA into OS and Firefox, **auto-register by subnet + token**, **issue loopback certs for itself**, ReadOnly mode when the master is down |
-| **Registration** | Clients self-register on startup; the master authorizes them by **enrollment token (anti-spoofing) AND source-IP CIDR** — no manual IP list |
-| **Transport** | Client→master path is **Root CA pinned** (SHA-256 fingerprint or chain) — no blind `InsecureSkipVerify` |
+| **Master** | Bootstrap Root CA (10y), CLI-only admin issuance, mTLS CSR signing, replicated AES-GCM-256 cache, revocation |
+| **Client** | Auto-install Root CA into OS + Firefox, auto-enroll (token + subnet), receive an **mTLS identity**, issue loopback certs for itself, ReadOnly when master is down |
+| **Transport** | Bootstrap path **pinned to the Root CA**; control plane is **mutual TLS** on `:8443` |
+| **Replication** | **Pull-only** encrypted cache with **monotonic versioning** (anti-replay/stale); no inbound push surface |
+| **Isolation** | Root CA key **only ever signs** — TLS is served with a dedicated server leaf |
 | **DR** | 24-word seed (BIP-39), promote-to-master restoring the *identical* fingerprint |
-| **Network** | IPv4/IPv6, static discovery, ports `443` (ACME) and `8443` (mTLS) |
-| **Localhost** | Certificates for `127.0.0.1`/`::1`/`localhost` valid 1 year, *Same-PC only*, private key encrypted with a password |
+| **Localhost** | 1-year, Same-PC-only certs; private key encrypted with scrypt + AES-GCM |
 
 ---
 
@@ -46,52 +47,43 @@ no cloud.
 ```mermaid
 flowchart LR
     subgraph M["MASTER"]
-        direction TB
-        RCA["Root CA"]
-        DB["SQLite<br/>(clients + certs)"]
-        RPUB["recovery-pub"]
+        RCA["Root CA<br/>(signs only)"]
+        SRV["server leaf<br/>(TLS identity)"]
+        DB["SQLite"]
         TOK["enrollment token"]
     end
 
     subgraph C["CLIENT"]
-        direction TB
-        CS["Cert Store"]
-        ENC["encrypted cache<br/>(read-only)"]
-        PIN["pinned Root CA<br/>fingerprint"]
+        CID["mTLS identity"]
+        ENC["encrypted cache<br/>(versioned)"]
+        PIN["pinned Root CA"]
     end
 
-    C -- "register on boot (443)<br/>token + pinned TLS" --> M
-    M -- "issue / cache (443)<br/>pinned TLS" --> C
-    C -- "loopback CSR sign (443)<br/>pinned TLS" --> M
-    C -- "pull every 1h" --> M
-    M -- "push network-cache.enc (8443)" --> C
-
-    M -. "AES-GCM-256(snapshot)<br/>key sealed by recovery PUBLIC key" .-> CACHE["network-cache.enc<br/>stored as 'dead weight'"]
-    C -. "replicated" .-> CACHE
+    C -- "GET /ca + enroll (443)<br/>pinned TLS + token" --> M
+    M -- "issue client identity" --> C
+    C -- "PULL /sync/cache (8443)<br/>MUTUAL TLS" --> M
+    C -- "sign loopback CSR (8443)<br/>MUTUAL TLS" --> M
+    M -. "AES-GCM(snapshot), key sealed<br/>by recovery PUBLIC key" .-> ENC
 ```
 
-On disaster, a client holding the seed phrase decrypts the cache and becomes
-the master **with the same serial number and SHA-256 fingerprint** of the
-Root CA.
+The Root CA private key signs the **server leaf**, the **client identities**,
+and issued certificates — it is never used as an online TLS key.
 
 ---
 
 ## Requirements
 
-- **Go 1.22+** (for building)
+- **Go 1.22+** (build)
 - Linux: Ubuntu/Debian/CentOS/RHEL/Rocky
-- For Firefox integration: `certutil`
-  - Debian/Ubuntu: `apt-get install libnss3-tools`
-  - RHEL/Rocky/CentOS: `dnf install nss-tools`
+- Firefox integration: `certutil` (`libnss3-tools` / `nss-tools`)
 
 ---
 
 ## Building
 
 ```bash
-# Cross-compile for amd64 + arm64
-make release
-# or without make:
+make release         # cross-compile amd64 + arm64 tarballs into dist/
+# or:
 ./build.sh
 ```
 
@@ -99,275 +91,171 @@ Output:
 
 ```
 dist/
-├── natssl-1.0.0-oss-linux-amd64.tar.gz
-├── natssl-1.0.0-oss-linux-arm64.tar.gz
+├── natssl-1.0.7-oss-linux-amd64.tar.gz
+├── natssl-1.0.7-oss-linux-arm64.tar.gz
 └── SHA256SUMS.txt
 ```
 
-Pack the entire source tree into an archive:
+Pack the source tree:
 
 ```bash
-./pack.sh     # -> natssl-src.tar.gz  (uses `git archive` when in a repo)
+./pack.sh            # -> natssl-src.tar.gz (git archive when in a repo)
 ```
 
-Install the binary:
+Install:
 
 ```bash
-tar -xzf natssl-1.0.0-oss-linux-amd64.tar.gz
-sudo install -m 0755 natssl-1.0.0-oss-linux-amd64 /usr/local/bin/natssl
+tar -xzf natssl-1.0.7-oss-linux-amd64.tar.gz
+sudo install -m 0755 natssl-1.0.7-oss-linux-amd64 /usr/local/bin/natssl
 natssl --version
 ```
 
-> **Note:** SQLite is provided by the pure-Go `modernc.org/sqlite` driver, so
-> the build uses `CGO_ENABLED=0` and cross-compiles cleanly without a C toolchain.
+> Pure-Go build (`modernc.org/sqlite`, `CGO_ENABLED=0`) — no C toolchain, clean
+> cross-compile.
 
 ---
 
 ## Quick Start
 
-### 1. Generate a shared enrollment token (once)
+<details open>
+<summary><b>1 → 2 → 3: token, master, client</b></summary>
 
 ```bash
+# 1. Shared enrollment token (same value on master + every client)
 openssl rand -hex 32
-# e.g. 9f1c...  — put this SAME value on the master and on every client
-```
 
-### 2. Master
-
-```bash
-sudo natssl --mode=master --bootstrap
-# Write down the 24 words OFFLINE — shown only ONCE!
-# Also note the SHA-256 fingerprint printed here — clients pin it.
-
+# 2. Master
+sudo natssl --mode=master --bootstrap     # writes 24 words + prints fingerprint
+#   - set enrollment_token + client_networks in /etc/natssl/config.yaml
 sudo systemctl enable --now natssl-master
 sudo natssl --mode=master --issue "app.internal"
-```
 
-After bootstrap, from the master's `/etc/natssl/config.yaml` copy:
-- `recovery_public_key` (auto-filled)
-- the Root CA **fingerprint** (printed at bootstrap, or `openssl x509 ... -fingerprint -sha256`)
-
-Set `enrollment_token` in the master config to the value from step 1.
-
-### 3. Client
-
-In the client's `/etc/natssl/config.yaml` set:
-- `master_address`
-- `master_fingerprint` (the value from step 2)
-- `enrollment_token` (the value from step 1)
-- `recovery_public_key` (from the master)
-
-Then:
-
-```bash
+# 3. Client
+#   set master_address, master_fingerprint, enrollment_token, recovery_public_key
 sudo systemctl enable --now natssl-client
 ```
 
-The client pins the master's Root CA, installs it, and **registers itself**
-(token + IP) automatically. No manual IP list is required.
+The client pins the master's Root CA, installs it, enrolls (token + CIDR), and
+receives its own mTLS identity automatically.
+</details>
 
 ---
 
 ## Security Model
 
-Three independent controls protect the system:
+Four independent controls:
 
 | Control | Protects against | Mechanism |
 |---|---|---|
-| **Enrollment token** | IP spoofing on flat L2 (rogue self-registration) | Shared secret in `X-Enrollment-Token`, compared in constant time |
-| **Root CA pinning** | Rogue master / MITM on client→master | Client verifies the master's cert against a pinned SHA-256 fingerprint, or that it chains to the locally installed Root CA. **Fail-closed** if neither is available |
-| **Loopback-only clients** | Host impersonation via the shared Root CA | Clients can only obtain `localhost`/`127.0.0.1`/`::1` certs; enforced client-side **and** server-side (HTTP 403) |
+| **Enrollment token** | Rogue self-registration / IP spoofing | Shared secret in `X-Enrollment-Token`, constant-time compare, **mandatory** when registration is on |
+| **Root CA pinning** | Rogue master / MITM | Client verifies the master leaf chains to a **pinned Root CA** (by fingerprint, or the installed CA). Fail-closed |
+| **mTLS control plane** | Unauthenticated callers on `:8443` | `RequireAndVerifyClientCert`; every client has its own identity cert |
+| **Loopback-only clients** | Host impersonation via the shared CA | Clients can only mint `localhost`/`127.0.0.1`/`::1`; enforced client- and server-side |
 
-Additional guarantees:
+<details>
+<summary><b>Additional guarantees & honest gaps</b></summary>
 
-- The recovery private key is **never written to disk** on the master.
-- The network cache is encrypted with AES-GCM-256; the symmetric key is sealed
-  with the recovery public key (NaCl SealedBox) → clients cannot decrypt it.
-- The client leaf private key **never leaves the machine** (CSR-flow) and is
-  stored encrypted (scrypt N=2¹⁵ + AES-GCM-256) under the user's password.
-- Migration packets are signed with the Root CA key and verified by clients.
+- The Root CA key is isolated: it **only signs** (server leaf, client identities,
+  certs). TLS is served with the server leaf — never the CA key.
+- The recovery private key is **never written to disk**.
+- The cache is AES-GCM-256 encrypted; its symmetric key is sealed with the
+  recovery public key (NaCl SealedBox) — clients cannot decrypt it.
+- Replication is **pull-only** with a **monotonic version**; stale/replayed
+  caches are rejected. There is **no inbound cache-push surface**.
+- HTTP handlers enforce method, 1 MiB body cap, timeouts, atomic writes, and
+  emit `AUDIT` log lines.
 
-> ⚠️ **Honest residual gaps (OSS edition):**
-> - The enrollment token is a **shared** secret — compromise of one client
->   leaks it for all. The clean fix is per-client mTLS identities issued at
->   enrollment (commercial edition).
-> - The **master→client push** (`:8443`) is not mutually authenticated; the
->   payload is already AES-GCM-encrypted + sealed, so no plaintext is exposed,
->   but enabling strict mTLS on this direction is recommended for production.
-> See "Hardening" in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+**Residual gaps (OSS edition):**
+- The enrollment token is **shared** — rotate after any client compromise.
+  One-time/expiring join tokens are the next step (commercial edition).
+- The signed migration broadcast (`:8443 /migrate`) is delivered over an
+  unverified transport, but the **payload is ECDSA-signed by the Root CA** and
+  verified by the receiver.
+- Revocation is a propagated list (`/sync/crl`), not full CRL/OCSP yet.
+</details>
 
 ---
 
 ## Client Auto-Registration
 
-Clients are **not** listed by hand. The master authorizes self-registration by
-**two** gates that must **both** pass:
-
-1. **Enrollment token** — a shared secret in the `X-Enrollment-Token` header
-   (defeats IP spoofing).
-2. **Network CIDR** — the client's source IP must fall inside a
-   `client_networks` range.
-
-```mermaid
-sequenceDiagram
-    participant C as Client (boot)
-    participant M as Master
-
-    C->>M: POST /acme/register (pinned TLS, X-Enrollment-Token)
-    M->>M: token == enrollment_token? (constant-time)
-    alt token invalid/missing
-        M-->>C: 403 invalid or missing enrollment token
-    else token OK
-        M->>M: source IP in client_networks?
-        alt ip allowed
-            M->>M: AddClient(ip) (idempotent)
-            M-->>C: 200 {status: ok, new: true|false}
-            Note over M: client now receives cache push on :8443
-        else ip not allowed
-            M-->>C: 403 not in any allowed client network
-        end
-    end
-
-    loop every ping_interval
-        C->>M: POST /acme/register (re-announce)
-    end
-```
-
-> If `enrollment_token` is empty on the master, it logs a warning and falls
-> back to **CIDR-only** (spoofable). If `client_networks` is empty, no client
-> can register. The optional static `clients:` list remains as a fallback.
-
-Verify registrations on the master:
+Two gates must **both** pass: a valid **enrollment token** *and* a source IP
+inside `client_networks`. On success the master issues the client an **mTLS
+identity certificate** used for all `:8443` operations.
 
 ```bash
-journalctl -u natssl-master | grep "client registered"
-# client registered: 192.168.10.20
+journalctl -u natssl-master | grep AUDIT
+# AUDIT client 192.168.10.20 enrolled (issued mTLS identity)
 ```
 
 ---
 
 ## Issuing a Certificate as a Client (CSR-flow)
 
-> **Hard rule:** a client can issue certificates **only for loopback**
-> (`localhost`, `127.0.0.1`, `::1`). Any other domain or IP is **rejected** —
-> both locally (before contacting the master) and on the master (HTTP 403).
->
-> Certificates for real domains/IPs are issued **only by the administrator**
-> on the master via `natssl --mode=master --issue "..."`.
-
-| Requester | Allowed targets |
-|---|---|
-| **Client** (`--mode=client --issue`) | `localhost`, `127.0.0.1`, `::1` only |
-| **Admin** (`--mode=master --issue`) | any `*.internal` / `*.local` / IP / domain |
-
-The leaf private key is generated **locally** on the client and never leaves
-the machine; only the public part travels inside the CSR. The CSR is sent over
-the **pinned** transport.
-
-### Allowed (client)
+> **Hard rule:** clients may issue **only loopback** certs. Enforced locally,
+> then again on the master (HTTP 403). Domain/IP certs are an administrator
+> action on the master.
 
 ```bash
-sudo natssl --mode=client --issue "localhost" --localhost
-sudo natssl --mode=client --issue "127.0.0.1"
-# ↳ you will be prompted for a password to encrypt the private key
+sudo natssl --mode=client --issue "localhost" --localhost   # over mutual TLS
+natssl --mode=client --decrypt-key=/var/lib/natssl/issued/localhost.key.enc > key.pem
 ```
 
-Result:
+The leaf private key is generated locally and never leaves the machine. If the
+master is unreachable, issuance is blocked (ReadOnly); existing certs keep
+working.
 
-```
-✔ Loopback certificate issued for "localhost"
-  cert: /var/lib/natssl/issued/localhost.crt
-  key : /var/lib/natssl/issued/localhost.key.enc  (encrypted, this PC only)
-```
+---
 
-### Rejected (client)
+## Revocation
 
 ```bash
-sudo natssl --mode=client --issue "dev.internal"   # -> error: loopback only
-sudo natssl --mode=client --issue "192.168.10.20"  # -> error: loopback only
+# On the master:
+sudo natssl --mode=master --revoke "<serial-hex>"
 ```
 
-### Decrypt the private key for use
-
-```bash
-natssl --mode=client \
-  --decrypt-key=/var/lib/natssl/issued/localhost.key.enc > /tmp/localhost.key
-chmod 600 /tmp/localhost.key
-```
-
-Use it in a dev server (Go example):
-
-```go
-cert, _ := tls.LoadX509KeyPair(
-    "/var/lib/natssl/issued/localhost.crt",
-    "/tmp/localhost.key",
-)
-srv := &http.Server{
-    Addr:      ":8443",
-    TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
-}
-```
-
-The browser already trusts the certificate — the Root CA was installed by the
-client into the OS and Firefox.
-
-> ⚠️ If the master is unreachable, issuing new certificates is **blocked**
-> (ReadOnly). Previously issued certificates keep working until they expire.
+The revocation is recorded, the encrypted cache is rebuilt, and clients fetch
+the updated list from `/sync/crl` on their next pull.
 
 ---
 
 ## Configuration
 
-The repository ships two example files: `config.master.yaml` and
-`config.client.yaml`. Install the appropriate one as `/etc/natssl/config.yaml`.
-
-### Master — `config.master.yaml`
+<details open>
+<summary><b>Master / Client examples</b></summary>
 
 ```yaml
+# config.master.yaml
 mode: master
 data_dir: /var/lib/natssl
-listen:
-  acme: ":443"
-  mgmt: ":8443"
+listen: { acme: ":443", mgmt: ":8443" }
 recovery_public_key: ""          # auto-filled on bootstrap
-enrollment_token: "REPLACE_ME"   # openssl rand -hex 32  (anti-spoofing)
-client_networks:                 # WHO is allowed to self-register
+enrollment_token: "REPLACE_ME"   # REQUIRED when client_networks is set
+client_networks:
   - "192.168.10.0/24"
-  - "10.0.0.0/16"
-# clients: []                    # optional static fallback; usually empty
 pull_interval: 1h
 ```
 
-### Client — `config.client.yaml`
-
 ```yaml
+# config.client.yaml
 mode: client
 data_dir: /var/lib/natssl
-master_address: "192.168.10.5"        # REQUIRED — the client self-registers here
-master_fingerprint: "AB:CD:..."       # SHA-256 of master Root CA (pinning)
+master_address: "192.168.10.5"
+master_fingerprint: "AB:CD:...:99"   # SHA-256 from master bootstrap
 recovery_public_key: "<paste from master>"
-enrollment_token: "REPLACE_ME"        # SAME value as on the master
-ping_interval: 5m                     # also drives the re-registration cadence
+enrollment_token: "REPLACE_ME"       # SAME value as the master
+ping_interval: 5m
 ```
+</details>
 
 | Field | Where | Purpose |
 |---|---|---|
-| `enrollment_token` | both | Shared secret required to self-register. Defeats IP spoofing. Generate with `openssl rand -hex 32`. |
-| `master_fingerprint` | client | SHA-256 of the master's Root CA cert. The client pins the master to this value (works even before the CA is on disk). Colons optional. |
-| `client_networks` | master | Allowed subnets (CIDR). A client may register only if its source IP is inside one of them. Empty ⇒ no client can register. |
-| `master_address` | client | The master's IP. The client registers here on startup and pulls the cache from it. |
-| `recovery_public_key` | both | Auto-filled on the master at bootstrap; copied to clients. Needed to decrypt the cache during recovery. |
-| `ping_interval` | client | Re-registration cadence (survives a master restart / DB reset). |
-| `pull_interval` | master | Cache fan-out cadence to all registered clients. |
-| `clients` | master (optional) | Legacy manual push list. No longer required — leave empty. |
-
-Generate the secrets:
+| `enrollment_token` | both | Shared secret to enroll. **Mandatory** on the master when `client_networks` is set (fail-closed). |
+| `master_fingerprint` | client | SHA-256 of the master Root CA. Clients pin to it. |
+| `client_networks` | master | CIDRs allowed to self-register. |
+| `recovery_public_key` | both | Auto-filled on bootstrap; needed to decrypt the cache during recovery. |
 
 ```bash
-# Enrollment token (run once; same value on master + every client)
-openssl rand -hex 32
-
-# Master fingerprint (if you didn't copy it from bootstrap output)
+# fingerprint (also printed at bootstrap):
 openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
 ```
 
@@ -376,17 +264,13 @@ openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
 ## Disaster Recovery
 
 ```bash
-sudo natssl --mode=client --promote-to-master \
-  --token="word1 word2 ... word24"
+sudo natssl --mode=client --promote-to-master --token="word1 ... word24"
 ```
 
-A mandatory **safety chain** runs before activation:
-
-1. TCP health-check of the old master (`443`/`8443`) → alive → **abort**.
-2. ICMP + ARP (`/proc/net/arp`) → responds → **block**.
-3. Local IP conflict with the old master → **block**.
-
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
+Safety chain before activation: TCP health (443/8443) → ICMP+ARP → local IP
+conflict. The Root CA is restored **byte-for-byte** (same fingerprint), so
+existing client pins keep working; only `master_address` changes (delivered via
+the signed migration packet). See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
@@ -394,18 +278,19 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
 
 | Command | Purpose |
 |---|---|
-| `natssl --mode=master --bootstrap` | Initialize Root CA + seed phrase; prints fingerprint |
-| `natssl --mode=master` | Run the master (443 + 8443) |
-| `natssl --mode=master --issue "X" [--localhost]` | Issue any cert (master generates the key) |
-| `natssl --mode=client` | Run the client (pin + install CA, auto-register, pull/receive cache) |
-| `natssl --mode=client --issue "localhost"` | **Issue a loopback cert for yourself** (CSR-flow) |
-| `natssl --mode=client --decrypt-key=FILE` | Decrypt a `.key.enc` to stdout |
-| `natssl --mode=client --promote-to-master --token="..."` | Disaster-recovery promotion |
-| `natssl --version` | Show version |
+| `--mode=master --bootstrap` | Initialize Root CA + seed; print fingerprint |
+| `--mode=master` | Run master (`:443` bootstrap, `:8443` mTLS) |
+| `--mode=master --issue "X" [--localhost]` | CLI-only issuance (any target) |
+| `--mode=master --revoke "<serial>"` | Revoke by hex serial |
+| `--mode=client` | Run client (install CA, enroll, pull) |
+| `--mode=client --issue "localhost"` | Issue a loopback cert (CSR-flow over mTLS) |
+| `--mode=client --decrypt-key=FILE` | Decrypt a `.key.enc` to stdout |
+| `--mode=client --promote-to-master --token="..."` | DR promotion |
+| `--version` | Show version |
 
 ---
 
 ## License
 
-Apache-2.0 (OSS version). Clustering (Raft, N>1 masters) and per-client mTLS
-enrollment are part of the commercial edition.
+Apache-2.0 (OSS). Clustering (Raft, N>1 masters) and one-time per-client
+enrollment identities are part of the commercial edition.
