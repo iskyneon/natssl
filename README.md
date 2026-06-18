@@ -93,6 +93,7 @@ curl -fsSL -O https://github.com/iskyneon/natssl/releases/download/1.0.8/natssl-
 tar -xzf natssl-1.0.8-oss-linux-amd64.tar.gz
 sudo install -m 0755 natssl-1.0.8-oss-linux-amd64 /usr/local/bin/natssl
 natssl --version
+```
 
 ---
 
