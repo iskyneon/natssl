@@ -2,166 +2,192 @@ package main
 
 import (
 	"crypto/ecdsa"
-	"crypto/sha256"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
-	"strings"
-	"sync/atomic"
 	"time"
 )
 
-var masterAvailable atomic.Bool
-
+// RunClient boots the client: refresh + install the Root CA, self-register with
+// the master, accept replicated cache pushes on :8443, and periodically pull
+// the cache. New certificate issuance is handled separately (RunClientIssue)
+// and is loopback-only.
 func RunClient(cfg *Config) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
+	if cfg.MasterAddress == "" {
+		return fmt.Errorf("master_address is required in client mode")
+	}
 
-	// 1. Скачать и установить Root CA в ОС и Firefox (нужны права root).
+	log.Printf("client starting | master=%s", cfg.MasterAddress)
+
+	// 1. Fetch the Root CA from the master and install it into the OS + Firefox.
 	if err := fetchAndInstallRootCA(cfg); err != nil {
-		log.Printf("WARN: root CA install: %v", err)
+		log.Printf("WARNING: could not install Root CA yet: %v (will retry on pull)", err)
 	}
 
-	// 2. HTTP-сервер 8443: приём зашифрованного кэша и пакетов миграции.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/cache/push", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		// Критично: клиент НЕ может расшифровать — просто сохраняет «мёртвым грузом».
-		os.WriteFile(cfg.cachePath(), body, 0o600)
-		w.Write([]byte("stored"))
-		log.Printf("encrypted network cache stored (%d bytes, undecryptable on client)", len(body))
-	})
-	mux.HandleFunc("/migrate", func(w http.ResponseWriter, r *http.Request) {
-		var pkt MigrationPacket
-		if err := json.NewDecoder(r.Body).Decode(&pkt); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		if err := applyMigration(cfg, &pkt); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		w.Write([]byte("master updated"))
-	})
-	go func() {
-		srv := &http.Server{
-			Addr:      ":8443",
-			Handler:   mux,
-			TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
-		}
-		// Самоподписанный серверный сертификат клиента (для приёма push).
-		certFile, keyFile := ensureClientServerCert(cfg)
-		log.Printf("client sync listener on :8443")
-		if err := srv.ListenAndServeTLS(certFile, keyFile); err != nil {
-			log.Printf("client listener stopped: %v", err)
-		}
-	}()
+	// 2. Self-register with the master (idempotent, retried on PingInterval).
+	StartRegistrationLoop(cfg)
 
-	// 3. Ping мастера каждые ping_interval; ReadOnly при недоступности.
-	t := time.NewTicker(cfg.PingInterval)
-	defer t.Stop()
-	pingMaster(cfg)
-	for range t.C {
-		pingMaster(cfg)
-		// Pull-модель: забираем кэш раз в час (упрощённо — при доступности).
-		if masterAvailable.Load() {
-			pullCache(cfg)
-		}
-	}
-	return nil
+	// 3. Accept cache pushes from the master on :8443.
+	go runCacheReceiver(cfg)
+
+	// 4. Periodically pull the cache (and refresh the Root CA) as a fallback.
+	go runPullLoop(cfg)
+
+	// 5. Block forever.
+	select {}
 }
 
-func pingMaster(cfg *Config) {
-	ok := tcpHealthy(cfg.MasterAddress, 5*time.Second, 443) ||
-		tcpHealthy(cfg.MasterAddress, 5*time.Second, 8443)
-	prev := masterAvailable.Swap(ok)
-	if ok && !prev {
-		log.Printf("master %s ONLINE — full operation restored", cfg.MasterAddress)
-	}
-	if !ok && prev {
-		// ВАЖНО: Root CA не удаляется. Старые сертификаты остаются доверенными.
-		log.Printf("master %s DOWN — entering READ-ONLY mode "+
-			"(existing certs still trusted, new issuance blocked)", cfg.MasterAddress)
-	}
-}
-
+// fetchAndInstallRootCA downloads the Root CA from the master and installs it.
 func fetchAndInstallRootCA(cfg *Config) error {
-	client := insecureBootstrapClient() // первый контакт: CA ещё не в системе
-	resp, err := client.Get(fmt.Sprintf("https://%s:443/ca", host(cfg.MasterAddress)))
+	url := fmt.Sprintf("https://%s:443/ca", host(cfg.MasterAddress))
+	resp, err := insecureMasterClient().Get(url)
 	if err != nil {
-		// возможно, CA уже стоит локально — не критично
 		return err
 	}
 	defer resp.Body.Close()
-	pemBytes, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(pemBytes), "BEGIN CERTIFICATE") {
-		return fmt.Errorf("master did not return a valid CA certificate")
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("master returned %d for /ca", resp.StatusCode)
 	}
-	return InstallRootCA(pemBytes)
-}
-
-func pullCache(cfg *Config) {
-	client := insecureMasterClient()
-	resp, err := client.Get(fmt.Sprintf("https://%s:443/cache", host(cfg.MasterAddress)))
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if len(data) > 0 {
-		os.WriteFile(cfg.cachePath(), data, 0o600)
-	}
-}
-
-// ---- Приём пакета миграции при аварийном промоушене нового мастера ----
-
-type MigrationPacket struct {
-	NewMasterIP string    `json:"new_master_ip"`
-	IssuedAt    time.Time `json:"issued_at"`
-	Signature   []byte    `json:"signature"` // ECDSA(SHA-256(payload)) ключом Root CA
-}
-
-func migrationDigest(p *MigrationPacket) [32]byte {
-	return sha256.Sum256([]byte(p.NewMasterIP + "|" + p.IssuedAt.UTC().Format(time.RFC3339)))
-}
-
-func applyMigration(cfg *Config, pkt *MigrationPacket) error {
-	// Верификация подписи тем Root CA, который уже стоит в ОС клиента.
-	caCert, err := LoadInstalledRootCA()
-	if err != nil {
-		return fmt.Errorf("cannot load installed Root CA: %w", err)
-	}
-	pub, ok := caCert.PublicKey.(*ecdsa.PublicKey)
-	if !ok {
-		return fmt.Errorf("Root CA key is not ECDSA")
-	}
-	d := migrationDigest(pkt)
-	if !ecdsa.VerifyASN1(pub, d[:], pkt.Signature) {
-		return fmt.Errorf("migration packet signature INVALID — rejected")
-	}
-	// Подпись валидна — перезаписываем IP мастера в конфиге.
-	cfg.MasterAddress = pkt.NewMasterIP
-	if err := cfg.Save(); err != nil {
 		return err
 	}
-	log.Printf("MIGRATION ACCEPTED: master IP updated to %s", pkt.NewMasterIP)
+	if err := os.WriteFile(cfg.caCertPath(), data, 0o644); err != nil {
+		return err
+	}
+
+	// Trust-store integration (see install.go).
+	if err := InstallRootCAIntoOS(cfg.caCertPath()); err != nil {
+		log.Printf("OS trust store: %v", err)
+	}
+	if err := InstallRootCAIntoFirefox(cfg.caCertPath()); err != nil {
+		log.Printf("Firefox trust store: %v", err)
+	}
+	log.Printf("Root CA installed from master (%d bytes)", len(data))
 	return nil
 }
 
-func ensureClientServerCert(cfg *Config) (string, string) {
-	cp := cfg.DataDir + "/client-server.crt"
-	kp := cfg.DataDir + "/client-server.key"
-	if _, err := os.Stat(cp); err == nil {
-		return cp, kp
+// runCacheReceiver serves :8443 to accept replicated cache pushes.
+func runCacheReceiver(cfg *Config) {
+	cert, err := ephemeralSelfSigned()
+	if err != nil {
+		log.Fatalf("cache receiver: cannot create ephemeral cert: %v", err)
 	}
-	// Самоподписанный, только для транспортного приёма push.
-	tmp, _ := BootstrapCA()
-	tmp.SaveToFiles(cp, kp)
-	return cp, kp
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/cache/push", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := os.WriteFile(cfg.cachePath(), data, 0o600); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		log.Printf("cache received from master (%d bytes)", len(data))
+		w.Write([]byte("ok"))
+	})
+
+	srv := &http.Server{
+		Addr:    cfg.Listen.Mgmt, // :8443
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		},
+	}
+	log.Printf("cache receiver on %s", cfg.Listen.Mgmt)
+	if err := srv.ListenAndServeTLS("", ""); err != nil {
+		log.Fatalf("cache receiver failed: %v", err)
+	}
+}
+
+// runPullLoop periodically pulls the encrypted cache from the master and
+// refreshes the Root CA. This is the fallback path when push is missed.
+func runPullLoop(cfg *Config) {
+	pull := func() {
+		if _, err := os.Stat(cfg.caCertPath()); err != nil {
+			if e := fetchAndInstallRootCA(cfg); e != nil {
+				log.Printf("pull: Root CA refresh failed: %v", e)
+			}
+		}
+		url := fmt.Sprintf("https://%s:443/cache", host(cfg.MasterAddress))
+		resp, err := insecureMasterClient().Get(url)
+		if err != nil {
+			log.Printf("pull: master unreachable (READ-ONLY): %v", err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			log.Printf("pull: master returned %d", resp.StatusCode)
+			return
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
+		if err := os.WriteFile(cfg.cachePath(), data, 0o600); err != nil {
+			log.Printf("pull: cannot write cache: %v", err)
+			return
+		}
+		log.Printf("cache pulled from master (%d bytes)", len(data))
+	}
+
+	pull() // immediate
+	t := time.NewTicker(cfg.PullInterval)
+	defer t.Stop()
+	for range t.C {
+		pull()
+	}
+}
+
+// ephemeralSelfSigned creates a short-lived self-signed cert for the :8443
+// receiver. It is not part of the PKI trust chain.
+func ephemeralSelfSigned() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "natssl-client-receiver"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return tls.X509KeyPair(certPEM, keyPEM)
 }

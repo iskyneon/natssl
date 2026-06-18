@@ -68,7 +68,7 @@ func RunBootstrap(cfg *Config) error {
 		return err
 	}
 	defer st.Close()
-	for _, c := range cfg.Clients {
+	for _, c := range cfg.Clients { // optional static seed list
 		st.AddClient(c)
 	}
 	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
@@ -90,7 +90,6 @@ func RunBootstrap(cfg *Config) error {
 
 // enforceLoopbackOnly is the HARD authorization rule for client-submitted CSRs:
 // clients may ONLY obtain loopback certificates (localhost / 127.0.0.1 / ::1).
-// Any domain or non-loopback IP is rejected. Period.
 func enforceLoopbackOnly(csr *x509.CertificateRequest, localhost bool) error {
 	if !localhost {
 		return fmt.Errorf("clients may only request localhost certificates " +
@@ -124,7 +123,17 @@ func RunMaster(cfg *Config) error {
 	}
 	defer st.Close()
 
+	// Merge any static clients from config into the DB on startup.
+	for _, c := range cfg.Clients {
+		st.AddClient(c)
+	}
+
 	log.Printf("master online | fingerprint %s", ca.Fingerprint())
+	if len(cfg.ClientNetworks) > 0 {
+		log.Printf("auto-registration enabled for networks: %s", strings.Join(cfg.ClientNetworks, ", "))
+	} else {
+		log.Printf("WARNING: client_networks is empty — clients cannot self-register")
+	}
 
 	// Port 443 — ACME-compatible issuance API.
 	acmeMux := http.NewServeMux()
@@ -136,6 +145,23 @@ func RunMaster(cfg *Config) error {
 	})
 	acmeMux.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, cfg.cachePath())
+	})
+
+	// Client self-registration. The peer is identified by its real source IP
+	// (cannot be forged without network-level spoofing) and must fall inside a
+	// configured client_networks CIDR.
+	acmeMux.HandleFunc("/acme/register", func(w http.ResponseWriter, r *http.Request) {
+		ip := host(r.RemoteAddr)
+		if !cfg.ClientAllowed(ip) {
+			log.Printf("DENIED registration from %s (not in client_networks)", ip)
+			http.Error(w, "your IP is not in any allowed client network", 403)
+			return
+		}
+		newly := st.AddClient(ip)
+		if newly {
+			log.Printf("client registered: %s", ip)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"status": "ok", "ip": ip, "new": newly})
 	})
 
 	// Issuance where the master generates the key (admin-style; returns key).
@@ -218,7 +244,7 @@ func RunMaster(cfg *Config) error {
 		json.NewEncoder(w).Encode(map[string]string{"certificate": res.CertPEM})
 	})
 
-	// Periodic cache fan-out to clients.
+	// Periodic cache fan-out to all registered clients.
 	go func() {
 		t := time.NewTicker(cfg.PullInterval)
 		defer t.Stop()

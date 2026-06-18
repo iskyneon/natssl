@@ -1,0 +1,5 @@
+mode: client
+data_dir: /var/lib/natssl
+master_address: "192.168.10.5"   # REQUIRED — the client self-registers here
+recovery_public_key: "<copy from master>"
+ping_interval: 5m

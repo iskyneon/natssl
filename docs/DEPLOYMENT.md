@@ -36,6 +36,44 @@ The rule is enforced **twice** (defense in depth):
 A third backstop lives in `ca.go` (`SignCSR` validates loopback-only whenever
 `localhost=true`).
 
+### 2.1 Client Auto-Registration
+
+Clients are **not** listed by hand. The master trusts one or more CIDR ranges;
+any client whose source IP falls inside a range registers itself on startup
+(`register.go` → `/acme/register` on the master in `server.go`).
+
+```mermaid
+sequenceDiagram
+    participant C as Client (boot)
+    participant M as Master
+
+    C->>M: POST /acme/register   (TLS, no body)
+    M->>M: ip = source IP of the connection
+    alt ip in client_networks
+        M->>M: AddClient(ip)  (idempotent)
+        M-->>C: 200 {status: ok, new: true|false}
+        Note over M: client now receives cache push on :8443
+    else ip not allowed
+        M-->>C: 403 not in any allowed client network
+    end
+
+    loop every ping_interval
+        C->>M: POST /acme/register  (re-announce)
+    end
+```
+
+**Master config:**
+
+```yaml
+client_networks:
+  - "192.168.10.0/24"
+  - "10.0.0.0/16"
+```
+
+> If `client_networks` is empty, **no client can self-register** and the master
+> logs a warning at startup. Use the optional static `clients:` list only for
+> special cases. Authorization is by **source IP** — see §7 for hardening.
+
 ---
 
 ## 3. Installing from a Release
@@ -58,11 +96,20 @@ sudo apt-get install -y libnss3-tools ca-certificates
 sudo dnf install -y nss-tools
 ```
 
+Install the matching config example as `/etc/natssl/config.yaml`:
+
+```bash
+# on the master
+sudo cp config.master.yaml /etc/natssl/config.yaml
+# on a client
+sudo cp config.client.yaml /etc/natssl/config.yaml
+```
+
 ---
 
 ## 4. systemd
 
-`/etc/systemd/system/natssl-master.service`:
+`natssl-master.service`:
 
 ```ini
 [Unit]
@@ -80,7 +127,7 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-`/etc/systemd/system/natssl-client.service`:
+`natssl-client.service`:
 
 ```ini
 [Unit]
@@ -104,9 +151,34 @@ sudo systemctl enable --now natssl-master   # or natssl-client
 
 ---
 
-## 5. Certificate Lifecycle
+## 5. End-to-End Rollout
 
-### 5.1 Administrator issues any cert on the master (`--issue`)
+```mermaid
+flowchart TD
+    A[Master: --bootstrap] --> B[Write 24 words OFFLINE]
+    B --> C[Copy recovery_public_key from master config]
+    C --> D[Start natssl-master.service]
+    D --> E[Client: set master_address + recovery_public_key]
+    E --> F[Start natssl-client.service]
+    F --> G[Client installs Root CA into OS + Firefox]
+    G --> H[Client POST /acme/register]
+    H --> I{source IP in client_networks?}
+    I -->|yes| J[Added to push list -> receives cache]
+    I -->|no| K[403 - fix client_networks on master]
+```
+
+Verify a client joined:
+
+```bash
+journalctl -u natssl-master | grep "client registered"
+# client registered: 192.168.10.20
+```
+
+---
+
+## 6. Certificate Lifecycle
+
+### 6.1 Administrator issues any cert on the master (`--issue`)
 
 The master generates both the key and the certificate locally via the CLI —
 this path bypasses the HTTP authorization layer and can target any name.
@@ -123,7 +195,7 @@ sequenceDiagram
     CA-->>A: write app.internal.crt + app.internal.key
 ```
 
-### 5.2 Client issues a LOOPBACK cert for itself (`/acme/sign-csr`)
+### 6.2 Client issues a LOOPBACK cert for itself (`/acme/sign-csr`)
 
 ```mermaid
 sequenceDiagram
@@ -132,11 +204,11 @@ sequenceDiagram
     participant M as Master (CA)
 
     U->>C: natssl --mode=client --issue "localhost" --localhost
-    C->>C: isLoopbackTarget("localhost")? ✔ allowed
+    C->>C: isLoopbackTarget("localhost")? YES - allowed
     C->>C: generate ECDSA P-256 keypair LOCALLY
     C->>C: build CSR with loopback SANs only
     C->>M: POST /acme/sign-csr {csr, localhost:true}
-    M->>M: enforceLoopbackOnly(csr) — reject if any non-loopback SAN
+    M->>M: enforceLoopbackOnly(csr) - reject if any non-loopback SAN
     M->>M: SignCSR (second loopback check)
     M-->>C: {certificate}
     C->>U: prompt for password
@@ -145,7 +217,7 @@ sequenceDiagram
     Note over C: the private key never left the machine
 ```
 
-### 5.3 Client requests a NON-loopback target — DENIED
+### 6.3 Client requests a NON-loopback target — DENIED
 
 ```mermaid
 sequenceDiagram
@@ -166,7 +238,7 @@ sequenceDiagram
 
 ---
 
-## 6. Disaster Scenario (DR)
+## 7. Disaster Scenario (DR)
 
 ```mermaid
 flowchart TD
@@ -195,27 +267,28 @@ openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
 
 ---
 
-## 7. Hardening (Production)
+## 8. Hardening (Production)
 
 | Risk | Action |
 |---|---|
 | `InsecureSkipVerify` in transport | Replace with `RootCAs` and Root CA pinning |
 | `/cache/push` without mTLS | Require a client certificate signed by the Root CA |
 | `/acme/sign-csr` without auth | Loopback-only is enforced, but it is **unauthenticated**; add mTLS or one-time enrollment tokens so only known clients can request even loopback certs |
-| Source-IP trust | Do not rely on source IP for authorization — it is spoofable on a flat L2 segment. Use mTLS identity instead |
+| `/acme/register` via source IP | Source IP is spoofable on a flat L2 segment. For production, gate registration behind a one-time enrollment token or mTLS so only known clients can join the push list |
+| Source-IP trust | Do not rely on source IP for authorization beyond coarse network gating — use mTLS identity instead |
 | localhost private key | scrypt(N=2¹⁵)+AES-GCM is **already enabled**; keep the password off the node |
 | seed phrase | store offline (paper/HSM), not in a password manager on the node |
 | file permissions | `root-ca.key`, `*.key.enc`, `network-cache.enc` → `0600` (already set) |
 
 > **Note on the loopback rule:** `enforceLoopbackOnly` prevents *privilege
 > escalation* (a client cannot obtain a cert for another host), but it does
-> **not** authenticate *which* client is asking. Any reachable peer can request
-> a `localhost` cert. For production, gate `/acme/sign-csr` behind mTLS so only
-> enrolled clients can call it.
+> **not** authenticate *which* client is asking. Likewise, `/acme/register`
+> only gates by network. For production, gate both endpoints behind mTLS so
+> only enrolled clients can call them.
 
 ---
 
-## 8. Diagnostics
+## 9. Diagnostics
 
 ```bash
 # Master reachability
@@ -226,8 +299,16 @@ nc -vz 192.168.10.5 8443
 journalctl -u natssl-master -f
 journalctl -u natssl-client -f
 
-# Watch for denied CSRs on the master
+# Auto-registration
+journalctl -u natssl-master | grep "client registered"     # accepted
+journalctl -u natssl-master | grep "DENIED registration"    # rejected (CIDR)
+journalctl -u natssl-client  | grep "self-registration"     # client side
+
+# Denied CSRs on the master
 journalctl -u natssl-master | grep "DENIED CSR"
+
+# Registered clients (over mTLS on :8443)
+# (served by /sync/clients)
 
 # Root CA in the OS
 trust list | grep -A2 NATSSL                              # RHEL family
@@ -244,9 +325,26 @@ openssl x509 -in /var/lib/natssl/issued/localhost.crt -noout -text | \
 
 ---
 
-## 9. Common Errors
+## 10. Common Errors
 
-### "issue failed: clients may only issue certificates for localhost / 127.0.0.1 / ::1"
+### Client never appears in the push list
+
+The master rejected registration. Check:
+
+```bash
+journalctl -u natssl-master | grep "DENIED registration"
+# DENIED registration from 192.168.99.7 (not in client_networks)
+```
+
+Fix `client_networks` on the master to include the client's subnet, then
+restart the master. The client retries automatically every `ping_interval`.
+
+### "registration rejected (403): your IP is not in any allowed client network"
+
+Same cause, seen from the client side. The client's source IP is outside every
+configured CIDR. Either widen `client_networks` or move the client.
+
+### "clients may only issue certificates for localhost / 127.0.0.1 / ::1"
 
 **Expected** — the client tried to request a non-loopback target. Domains/IPs
 must be issued by the administrator on the master:
@@ -272,7 +370,11 @@ unreachable. Options:
 
 ---
 
-## 10. FAQ
+## 11. FAQ
+
+**Do I still need to list clients by hand?**
+No. Set `client_networks` on the master and `master_address` on each client.
+Clients self-register on startup and re-register every `ping_interval`.
 
 **Why doesn't the client sign on its own?**
 Trust is built on a single Root CA. Distributing its key to every machine

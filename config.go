@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -22,7 +23,8 @@ type Config struct {
 	Listen            Listen        `yaml:"listen"`              // ports
 	MasterAddress     string        `yaml:"master_address"`      // client -> master host/IP
 	RecoveryPublicKey string        `yaml:"recovery_public_key"` // base64, auto-filled on bootstrap
-	Clients           []string      `yaml:"clients"`             // master push targets
+	ClientNetworks    []string      `yaml:"client_networks"`     // master: CIDRs allowed to self-register
+	Clients           []string      `yaml:"clients"`             // optional static push targets (fallback)
 	PullInterval      time.Duration `yaml:"pull_interval"`       // cache pull/push cadence
 	PingInterval      time.Duration `yaml:"ping_interval"`       // master health-check cadence
 
@@ -67,6 +69,13 @@ func LoadConfig(path string) (*Config, error) {
 	if c.PingInterval <= 0 {
 		c.PingInterval = 5 * time.Minute
 	}
+
+	// Validate CIDRs early so misconfiguration fails loudly on the master.
+	for _, cidr := range c.ClientNetworks {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return nil, fmt.Errorf("invalid client_networks entry %q: %w", cidr, err)
+		}
+	}
 	return c, nil
 }
 
@@ -83,6 +92,21 @@ func (c *Config) Save() error {
 		return err
 	}
 	return os.WriteFile(c.path, b, 0o644)
+}
+
+// ClientAllowed reports whether a peer IP is permitted to self-register.
+// A peer is allowed if its IP falls inside any configured client_networks CIDR.
+func (c *Config) ClientAllowed(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, cidr := range c.ClientNetworks {
+		if _, n, err := net.ParseCIDR(cidr); err == nil && n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- derived paths -------------------------------------------------------

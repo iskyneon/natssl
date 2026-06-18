@@ -17,6 +17,7 @@ no cloud.
 - [Requirements](#requirements)
 - [Building](#building)
 - [Quick Start](#quick-start)
+- [Client Auto-Registration](#client-auto-registration)
 - [Issuing a Certificate as a Client (CSR-flow)](#issuing-a-certificate-as-a-client-csr-flow)
 - [Configuration](#configuration)
 - [Disaster Recovery](#disaster-recovery)
@@ -31,7 +32,8 @@ no cloud.
 | Category | Capabilities |
 |---|---|
 | **Master** | Bootstrap Root CA (10y), issue any cert, sign loopback CSRs, replicated AES-GCM-256 cache |
-| **Client** | Auto-install Root CA into OS and Firefox, **issue loopback certs for itself**, ReadOnly mode when the master is down |
+| **Client** | Auto-install Root CA into OS and Firefox, **auto-register by subnet**, **issue loopback certs for itself**, ReadOnly mode when the master is down |
+| **Registration** | Clients self-register on startup; the master authorizes them by source IP against `client_networks` (CIDR) — no manual IP list |
 | **DR** | 24-word seed (BIP-39), promote-to-master restoring the *identical* fingerprint |
 | **Network** | IPv4/IPv6, static discovery, ports `443` (ACME) and `8443` (mTLS) |
 | **Localhost** | Certificates for `127.0.0.1`/`::1`/`localhost` valid 1 year, *Same-PC only*, private key encrypted with a password |
@@ -45,7 +47,7 @@ flowchart LR
     subgraph M["MASTER"]
         direction TB
         RCA["Root CA"]
-        DB["SQLite"]
+        DB["SQLite<br/>(clients + certs)"]
         RPUB["recovery-pub"]
     end
 
@@ -55,6 +57,7 @@ flowchart LR
         ENC["encrypted cache<br/>(read-only)"]
     end
 
+    C -- "register on boot (443)" --> M
     M -- "issue / cache (443)" --> C
     C -- "loopback CSR sign (443)" --> M
     C -- "pull every 1h" --> M
@@ -126,12 +129,58 @@ sudo systemctl enable --now natssl-master
 sudo natssl --mode=master --issue "app.internal"
 ```
 
+After bootstrap, copy the auto-filled `recovery_public_key` from the master's
+`/etc/natssl/config.yaml`.
+
 ### Client
 
-Copy `recovery_public_key` and `master_address` into `/etc/natssl/config.yaml`:
+Set `master_address` and paste `recovery_public_key` into the client's
+`/etc/natssl/config.yaml`, then:
 
 ```bash
 sudo systemctl enable --now natssl-client
+```
+
+The client installs the Root CA and **registers itself** with the master
+automatically. No manual IP list is required.
+
+---
+
+## Client Auto-Registration
+
+Clients are **not** listed by hand. The master trusts one or more CIDR ranges
+via `client_networks`; any client whose source IP falls inside a range
+registers itself on startup and starts receiving cache pushes.
+
+```mermaid
+sequenceDiagram
+    participant C as Client (boot)
+    participant M as Master
+
+    C->>M: POST /acme/register   (TLS, no body)
+    M->>M: ip = source IP of the connection
+    alt ip in client_networks
+        M->>M: AddClient(ip)  (idempotent)
+        M-->>C: 200 {status: ok, new: true|false}
+        Note over M: client now receives cache push on :8443
+    else ip not allowed
+        M-->>C: 403 not in any allowed client network
+    end
+
+    loop every ping_interval
+        C->>M: POST /acme/register  (re-announce)
+    end
+```
+
+> If `client_networks` is empty, **no client can self-register** and the master
+> logs a warning at startup. The optional static `clients:` list remains as a
+> fallback for special cases.
+
+Verify registrations on the master:
+
+```bash
+journalctl -u natssl-master | grep "client registered"
+# client registered: 192.168.10.20
 ```
 
 ---
@@ -207,22 +256,43 @@ client into the OS and Firefox.
 
 ## Configuration
 
-`/etc/natssl/config.yaml`:
+The repository ships two example files: `config.master.yaml` and
+`config.client.yaml`. Install the appropriate one as `/etc/natssl/config.yaml`.
+
+### Master — `config.master.yaml`
 
 ```yaml
-mode: client
+mode: master
 data_dir: /var/lib/natssl
 listen:
   acme: ":443"
   mgmt: ":8443"
-master_address: "192.168.10.5"
-recovery_public_key: ""    # auto-filled on the master during bootstrap
-clients:
-  - "192.168.10.20"
-  - "192.168.10.21"
+recovery_public_key: ""        # auto-filled on bootstrap
+client_networks:               # WHO is allowed to self-register
+  - "192.168.10.0/24"
+  - "10.0.0.0/16"
+# clients: []                  # optional static fallback; usually leave empty
 pull_interval: 1h
-ping_interval: 5m
 ```
+
+### Client — `config.client.yaml`
+
+```yaml
+mode: client
+data_dir: /var/lib/natssl
+master_address: "192.168.10.5" # REQUIRED — the client self-registers here
+recovery_public_key: "<paste from master>"
+ping_interval: 5m              # also drives the re-registration cadence
+```
+
+| Field | Where | Purpose |
+|---|---|---|
+| `client_networks` | master | Allowed subnets (CIDR). A client may register only if its source IP is inside one of them. Empty ⇒ no client can register. |
+| `master_address` | client | The master's IP. The client registers here on startup and pulls the cache from it. |
+| `recovery_public_key` | both | Auto-filled on the master at bootstrap; copied to clients. Needed to decrypt the cache during recovery. |
+| `ping_interval` | client | Re-registration cadence (survives a master restart / DB reset). |
+| `pull_interval` | master | Cache fan-out cadence to all registered clients. |
+| `clients` | master (optional) | Legacy manual push list. No longer required — leave empty. |
 
 ---
 
@@ -253,6 +323,10 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
   other host on the trusted network.
 - The client certificate's private key **never leaves the machine** (CSR-flow)
   and is stored encrypted (scrypt N=2¹⁵ + AES-GCM-256) under the user's password.
+- **Auto-registration is authorized by source IP** against `client_networks`.
+  Source IP is spoofable on a flat L2 segment — for production, gate
+  `/acme/register` behind a one-time token or mTLS (see Hardening in
+  `docs/DEPLOYMENT.md`).
 - Migration packets are signed with the Root CA key and verified by clients.
 
 > ⚠️ In the OSS version the cache-distribution transport is simplified
@@ -268,7 +342,7 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for details.
 | `natssl --mode=master --bootstrap` | Initialize Root CA + seed phrase |
 | `natssl --mode=master` | Run the master (443 + 8443) |
 | `natssl --mode=master --issue "X" [--localhost]` | Issue any cert (master generates the key) |
-| `natssl --mode=client` | Run the client (install CA, ping, receive cache) |
+| `natssl --mode=client` | Run the client (install CA, auto-register, pull/receive cache) |
 | `natssl --mode=client --issue "localhost"` | **Issue a loopback cert for yourself** (CSR-flow) |
 | `natssl --mode=client --decrypt-key=FILE` | Decrypt a `.key.enc` to stdout |
 | `natssl --mode=client --promote-to-master --token="..."` | Disaster-recovery promotion |

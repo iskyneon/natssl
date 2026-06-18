@@ -1,17 +1,22 @@
 package main
 
 import (
+	"crypto/x509"
 	"database/sql"
-	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite" // pure-Go driver, friendly to cross-compilation
 )
 
+// CertRecord is one issued (or signed) certificate as persisted in SQLite and
+// replicated inside the encrypted snapshot.
 type CertRecord struct {
 	ID        string    `json:"id"`
 	Subject   string    `json:"subject"`
-	SANs      string    `json:"sans"`
+	SANs      string    `json:"sans"` // comma-separated
 	NotBefore time.Time `json:"not_before"`
 	NotAfter  time.Time `json:"not_after"`
 	ClientPub string    `json:"client_pub"`
@@ -19,68 +24,119 @@ type CertRecord struct {
 	CertPEM   string    `json:"cert_pem"`
 }
 
-type Store struct{ db *sql.DB }
+// Snapshot is the full, recoverable state of the CA. It is JSON-encoded, then
+// AES-GCM encrypted, then the symmetric key is sealed with the recovery public
+// key. A promoted master restores the Root CA byte-for-byte from here.
+type Snapshot struct {
+	Version     int          `json:"version"`
+	CreatedAt   time.Time    `json:"created_at"`
+	Fingerprint string       `json:"fingerprint"`
+	CACertPEM   string       `json:"ca_cert_pem"`
+	CAKeyPEM    string       `json:"ca_key_pem"`
+	Clients     []string     `json:"clients"`
+	Certs       []CertRecord `json:"certs"`
+}
 
+// Store wraps the SQLite database.
+type Store struct {
+	db *sql.DB
+}
+
+// OpenStore opens (creating if needed) the SQLite database and ensures schema.
 func OpenStore(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
-	schema := `
-	CREATE TABLE IF NOT EXISTS certificates (
-		id TEXT PRIMARY KEY, subject TEXT, sans TEXT,
-		not_before TEXT, not_after TEXT, client_pub TEXT,
-		serial_hex TEXT, cert_pem TEXT
-	);
-	CREATE TABLE IF NOT EXISTS clients (addr TEXT PRIMARY KEY);
-	CREATE TABLE IF NOT EXISTS changelog (
-		seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, op TEXT, payload TEXT
-	);`
-	if _, err := db.Exec(schema); err != nil {
+	db.SetMaxOpenConns(1) // SQLite: serialize writes
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	return s, nil
 }
 
+func (s *Store) migrate() error {
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS clients (
+    ip         TEXT PRIMARY KEY,
+    added_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS certs (
+    id          TEXT PRIMARY KEY,
+    subject     TEXT,
+    sans        TEXT,
+    not_before  DATETIME,
+    not_after   DATETIME,
+    client_pub  TEXT,
+    serial_hex  TEXT,
+    cert_pem    TEXT
+);`)
+	return err
+}
+
+// Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) AddCert(r CertRecord) error {
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO certificates
-		(id,subject,sans,not_before,not_after,client_pub,serial_hex,cert_pem)
-		VALUES (?,?,?,?,?,?,?,?)`,
-		r.ID, r.Subject, r.SANs, r.NotBefore.Format(time.RFC3339),
-		r.NotAfter.Format(time.RFC3339), r.ClientPub, r.SerialHex, r.CertPEM)
-	if err != nil {
-		return err
+// AddClient inserts a client IP if absent. Returns true if it was newly added.
+func (s *Store) AddClient(ip string) bool {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return false
 	}
-	pl, _ := json.Marshal(r)
-	_, err = s.db.Exec(`INSERT INTO changelog (ts,op,payload) VALUES (?,?,?)`,
-		time.Now().Format(time.RFC3339), "issue", string(pl))
+	res, err := s.db.Exec(`INSERT OR IGNORE INTO clients(ip) VALUES(?)`, ip)
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n > 0
+}
+
+// RemoveClient deletes a client IP (used for housekeeping / manual eviction).
+func (s *Store) RemoveClient(ip string) error {
+	_, err := s.db.Exec(`DELETE FROM clients WHERE ip = ?`, strings.TrimSpace(ip))
 	return err
 }
 
-func (s *Store) AddClient(addr string) error {
-	_, err := s.db.Exec(`INSERT OR IGNORE INTO clients(addr) VALUES (?)`, addr)
-	return err
-}
-
+// ListClients returns all registered client IPs.
 func (s *Store) ListClients() ([]string, error) {
-	rows, err := s.db.Query(`SELECT addr FROM clients`)
+	rows, err := s.db.Query(`SELECT ip FROM clients ORDER BY ip`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() {
-		var a string
-		rows.Scan(&a)
-		out = append(out, a)
+		var ip string
+		if err := rows.Scan(&ip); err != nil {
+			return nil, err
+		}
+		out = append(out, ip)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
+// AddCert upserts an issued certificate record.
+func (s *Store) AddCert(rec CertRecord) error {
+	_, err := s.db.Exec(`
+INSERT INTO certs(id, subject, sans, not_before, not_after, client_pub, serial_hex, cert_pem)
+VALUES(?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET
+    subject=excluded.subject, sans=excluded.sans,
+    not_before=excluded.not_before, not_after=excluded.not_after,
+    client_pub=excluded.client_pub, serial_hex=excluded.serial_hex,
+    cert_pem=excluded.cert_pem`,
+		rec.ID, rec.Subject, rec.SANs, rec.NotBefore, rec.NotAfter,
+		rec.ClientPub, rec.SerialHex, rec.CertPEM)
+	return err
+}
+
+// ListCerts returns all certificate records.
 func (s *Store) ListCerts() ([]CertRecord, error) {
-	rows, err := s.db.Query(`SELECT id,subject,sans,not_before,not_after,client_pub,serial_hex,cert_pem FROM certificates`)
+	rows, err := s.db.Query(`
+SELECT id, subject, sans, not_before, not_after, client_pub, serial_hex, cert_pem
+FROM certs ORDER BY not_before`)
 	if err != nil {
 		return nil, err
 	}
@@ -88,56 +144,47 @@ func (s *Store) ListCerts() ([]CertRecord, error) {
 	var out []CertRecord
 	for rows.Next() {
 		var r CertRecord
-		var nb, na string
-		rows.Scan(&r.ID, &r.Subject, &r.SANs, &nb, &na, &r.ClientPub, &r.SerialHex, &r.CertPEM)
-		r.NotBefore, _ = time.Parse(time.RFC3339, nb)
-		r.NotAfter, _ = time.Parse(time.RFC3339, na)
+		if err := rows.Scan(&r.ID, &r.Subject, &r.SANs, &r.NotBefore, &r.NotAfter,
+			&r.ClientPub, &r.SerialHex, &r.CertPEM); err != nil {
+			return nil, err
+		}
 		out = append(out, r)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
-// Snapshot — содержимое recovery-кэша (DR-payload).
-type Snapshot struct {
-	CACertDER    []byte       `json:"ca_cert_der"`
-	CAKeyPKCS8   []byte       `json:"ca_key_pkcs8"`
-	Certificates []CertRecord `json:"certificates"`
-	Clients      []string     `json:"clients"`
-	CreatedAt    time.Time    `json:"created_at"`
-}
-
+// BuildSnapshot assembles the full recoverable state for the encrypted cache.
 func (s *Store) BuildSnapshot(ca *CA) (*Snapshot, error) {
-	certs, err := s.ListCerts()
-	if err != nil {
-		return nil, err
-	}
 	clients, err := s.ListClients()
 	if err != nil {
 		return nil, err
 	}
-	keyPKCS8, err := ca.KeyPKCS8()
+	certs, err := s.ListCerts()
+	if err != nil {
+		return nil, err
+	}
+	certPEM, keyPEM, err := caPEM(ca)
 	if err != nil {
 		return nil, err
 	}
 	return &Snapshot{
-		CACertDER:    ca.CertDER,
-		CAKeyPKCS8:   keyPKCS8,
-		Certificates: certs,
-		Clients:      clients,
-		CreatedAt:    time.Now(),
+		Version:     1,
+		CreatedAt:   time.Now().UTC(),
+		Fingerprint: ca.Fingerprint(),
+		CACertPEM:   certPEM,
+		CAKeyPEM:    keyPEM,
+		Clients:     clients,
+		Certs:       certs,
 	}, nil
 }
 
-func (s *Store) RestoreSnapshot(snap *Snapshot) error {
-	for _, c := range snap.Certificates {
-		if err := s.AddCert(c); err != nil {
-			return err
-		}
+// caPEM extracts the Root CA cert + key as PEM strings.
+func caPEM(ca *CA) (certPEM, keyPEM string, err error) {
+	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Cert.Raw})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(ca.Key)
+	if err != nil {
+		return "", "", fmt.Errorf("marshal CA key: %w", err)
 	}
-	for _, cl := range snap.Clients {
-		if err := s.AddClient(cl); err != nil {
-			return err
-		}
-	}
-	return nil
+	key := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return string(cert), string(key), nil
 }

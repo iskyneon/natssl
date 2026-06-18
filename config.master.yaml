@@ -1,0 +1,7 @@
+mode: master
+data_dir: /var/lib/natssl
+recovery_public_key: ""          # auto-filled on bootstrap
+client_networks:                 # WHO is allowed to self-register
+  - "192.168.10.0/24"
+  - "10.0.0.0/16"
+pull_interval: 1h
