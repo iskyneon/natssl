@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.7-oss}"
+VERSION="${VERSION:-1.0.8-oss}"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 OUT="dist"

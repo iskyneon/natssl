@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	Version   = "1.0.7-oss"
+	Version   = "1.0.8-oss"
 	Commit    = "nogit"
 	BuildDate = "unknown"
 )

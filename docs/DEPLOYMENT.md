@@ -1,4 +1,4 @@
-# NATSSL — Deployment Guide (1.0.7)
+# NATSSL — Deployment Guide
 
 ## 1. Topology
 
@@ -75,8 +75,8 @@ shared CA.
 
 ```bash
 ARCH=$(uname -m); case "$ARCH" in x86_64) A=amd64;; aarch64|arm64) A=arm64;; esac
-tar -xzf natssl-1.0.7-oss-linux-$A.tar.gz
-sudo install -m0755 natssl-1.0.7-oss-linux-$A /usr/local/bin/natssl
+tar -xzf natssl-1.0.x-oss-linux-$A.tar.gz
+sudo install -m0755 natssl-1.0.x-oss-linux-$A /usr/local/bin/natssl
 sudo mkdir -p /etc/natssl /var/lib/natssl
 
 # Firefox deps

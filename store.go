@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS certs (
 );`); err != nil {
 		return err
 	}
-	// Best-effort upgrade for pre-1.0.7 databases.
+	// Best-effort upgrade for old databases.
 	_, _ = s.db.Exec(`ALTER TABLE certs ADD COLUMN revoked INTEGER DEFAULT 0`)
 	return nil
 }

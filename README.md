@@ -6,7 +6,7 @@ A single binary acting as a Certificate Authority (Root CA) for private
 networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
 no cloud.
 
-![status](https://img.shields.io/badge/version-1.0.0--oss-blue)
+![status](https://img.shields.io/badge/version-1.0.8--oss-blue)
 ![platform](https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational)
 
 ---
