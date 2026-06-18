@@ -154,13 +154,13 @@ sequenceDiagram
     participant M as Master (CA)
 
     U->>C: natssl --mode=client --issue "dev.internal"
-    C->>C: isLoopbackTarget("dev.internal")? �’✗ NOT allowed
+    C->>C: isLoopbackTarget("dev.internal")? NO - not allowed
     C-->>U: error: clients may only issue localhost / 127.0.0.1 / ::1
     Note over C,M: request never reaches the master
 
     rect rgb(255, 235, 235)
     Note over M: Even if the CLI were bypassed and a raw CSR were posted,
-    M->>M: enforceLoopbackOnly(csr) → HTTP 403 DENIED
+    M->>M: enforceLoopbackOnly(csr) returns HTTP 403 DENIED
     end
 ```
 
