@@ -1,0 +1,109 @@
+---
+# Выпуск leaf-сертификатов НА МАСТЕРЕ для каждого клиента из [natssl_clients]
+# + (опц.) доставка .crt/.key обратно на сам клиент.
+# Запускается только по тегу issue_client_certs. serial:1 => строго хост за хостом.
+
+- name: natssl_issue | Verify the master is bootstrapped (deploy must have succeeded)
+  ansible.builtin.stat:
+    path: "{{ natssl_data_dir }}/root-ca.crt"
+  delegate_to: "{{ groups['natssl_master'][0] }}"
+  run_once: true
+  register: _natssl_ca
+
+- name: natssl_issue | Fail early if the master has no Root CA
+  ansible.builtin.assert:
+    that:
+      - _natssl_ca.stat.exists
+    fail_msg: >-
+      Root CA not found at {{ natssl_data_dir }}/root-ca.crt on
+      {{ groups['natssl_master'][0] }} — run the deploy playbook first.
+    success_msg: "Master Root CA present — proceeding with per-client issuance."
+  run_once: true
+
+- name: natssl_issue | Compute issuance subjects for this client
+  ansible.builtin.set_fact:
+    _natssl_subjects: >-
+      {{
+        (
+          ([ansible_host]
+             if natssl_client_cert_subject in ['ip', 'both']
+             else [])
+          +
+          ([inventory_hostname]
+             if (natssl_client_cert_subject in ['hostname', 'both']
+                 and '.' in inventory_hostname)
+             else [])
+        ) | unique
+      }}
+
+- name: natssl_issue | Warn about non-FQDN hostnames skipped for issuance
+  ansible.builtin.debug:
+    msg: >-
+      Skipping hostname '{{ inventory_hostname }}' — not an FQDN.
+      NATSSL refuses dot-less names; use an IP or rename to host.internal / host.local.
+  when:
+    - natssl_client_cert_subject in ['hostname', 'both']
+    - "'.' not in inventory_hostname"
+
+# --------------------------------------------------------------------------
+# Выпуск на мастере (неинтерактивно). creates => идемпотентно, кроме reissue.
+# --------------------------------------------------------------------------
+- name: natssl_issue | Issue certificate(s) on the master (sequential)
+  ansible.builtin.command:
+    cmd: >-
+      {{ natssl_bin }} --mode=master
+      --issue '{{ item }}'
+      --config {{ natssl_conf_file }}
+    creates: >-
+      {{ omit if natssl_reissue | bool
+         else natssl_data_dir ~ '/issued/'
+              ~ (item | regex_replace('[*/:\\\\]', '_')) ~ '.crt' }}
+  loop: "{{ _natssl_subjects }}"
+  delegate_to: "{{ groups['natssl_master'][0] }}"
+  register: _natssl_issue
+
+# --------------------------------------------------------------------------
+# Доставка .crt/.key с мастера обратно на сам клиент (slurp -> copy в памяти).
+# --------------------------------------------------------------------------
+- name: natssl_issue | Read issued cert + key from the master
+  ansible.builtin.slurp:
+    src: >-
+      {{ natssl_data_dir }}/issued/{{ item.0 | regex_replace('[*/:\\\\]', '_') }}{{ item.1 }}
+  loop: "{{ _natssl_subjects | product(['.crt', '.key']) | list }}"
+  delegate_to: "{{ groups['natssl_master'][0] }}"
+  register: _natssl_files
+  when: natssl_deliver_certs | bool
+
+- name: natssl_issue | Ensure issued dir exists on the client
+  ansible.builtin.file:
+    path: "{{ natssl_client_issued_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: natssl_deliver_certs | bool
+
+- name: natssl_issue | Deliver certs/keys to the client
+  ansible.builtin.copy:
+    content: "{{ item.content | b64decode }}"
+    dest: >-
+      {{ natssl_client_issued_dir }}/{{ item.item.0 | regex_replace('[*/:\\\\]', '_') }}{{ item.item.1 }}
+    owner: root
+    group: root
+    # .key -> 0600, .crt -> 0644
+    mode: "{{ '0600' if item.item.1 == '.key' else '0644' }}"
+  loop: "{{ _natssl_files.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0 }}{{ item.item.1 }}"
+  when:
+    - natssl_deliver_certs | bool
+    - not (item.skipped | default(false))
+
+- name: natssl_issue | Per-client summary
+  ansible.builtin.debug:
+    msg: >-
+      [{{ inventory_hostname }}] subjects={{ _natssl_subjects }}
+      reissue={{ natssl_reissue | bool }}
+      delivered={{ natssl_deliver_certs | bool }}
+      → client dir {{ natssl_client_issued_dir }}
+

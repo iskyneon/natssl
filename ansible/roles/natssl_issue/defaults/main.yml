@@ -1,0 +1,18 @@
+---
+# Что использовать как subject сертификата для каждого клиента:
+#   ip       -> ansible_host (IP)              [по умолчанию, всегда валидно]
+#   hostname -> inventory_hostname (только FQDN с точкой / .local / .internal)
+#   both     -> и IP, и FQDN-хостнейм (два сертификата)
+natssl_client_cert_subject: "ip"
+
+# Перевыпуск: при true убирает идемпотентность (creates) и заставляет
+# мастер перезаписать существующий серт/ключ. Включается через:
+#   --tags issue_client_certs -e natssl_reissue=true
+natssl_reissue: false
+
+# Доставлять ли выпущенные .crt/.key с мастера обратно на сам клиент.
+natssl_deliver_certs: true
+
+# Куда на КЛИЕНТЕ класть доставленные leaf-серты.
+natssl_client_issued_dir: "{{ natssl_data_dir }}/issued"
+

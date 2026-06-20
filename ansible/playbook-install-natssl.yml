@@ -20,3 +20,17 @@
   roles:
     - natssl_client
 
+# 4) (ОПЦИОНАЛЬНО, по тегу) Выпуск сертификатов на мастере для каждого клиента
+#    + доставка .crt/.key обратно на клиент. Не выполняется в обычном прогоне.
+#    serial: 1 => строго ПОСЛЕДОВАТЕЛЬНО, хост за хостом из [natssl_clients].
+#    Перевыпуск: добавь -e natssl_reissue=true
+- name: NATSSL — issue per-client certificates on the master
+  hosts: natssl_clients
+  become: true
+  gather_facts: false
+  serial: 1
+  tags:
+    - never
+    - issue_client_certs
+  roles:
+    - natssl_issue

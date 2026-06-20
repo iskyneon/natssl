@@ -1,3 +1,4 @@
+````markdown
 # NATSSL — Ansible
 
 Automated deployment of [NATSSL](https://github.com/iskyneon/natssl) onto your
@@ -13,17 +14,22 @@ and `recovery_public_key` to clients via `hostvars`.
 
 ## What the playbook does
 
-Three plays in order (`playbook-install-natssl.yml`):
+Three plays in order (`playbook-install-natssl.yml`), plus one **optional** tag-gated play:
 
 | Play | Group | Role | Actions |
 | --- | --- | --- | --- |
 | 1. common | `natssl_master:natssl_clients` | `natssl_common` | arch-detect, directories, `nss-tools`/`libnss3-tools`, download+install binary |
 | 2. master | `natssl_master` | `natssl_master` | config → bootstrap (once) → start → **export fingerprint + recovery key** as facts |
 | 3. clients | `natssl_clients` | `natssl_client` | config (pin fingerprint from master's `hostvars`) → start → enroll |
+| 4. issue *(opt, tag)* | `natssl_clients` | `natssl_issue` | **after a successful deploy:** issue a leaf cert **on the master** for every client (sequential, `serial: 1`) and optionally deliver `.crt`/`.key` back to the client |
 
 > ⚠️ The playbook deliberately **does not** save the **24-word seed phrase** — it is
 > printed once at bootstrap (the `natssl_master` role outputs it via `debug`).
 > Record it **offline** right during the run. See [Secrets](#secrets).
+
+> ℹ️ Play 4 is **opt-in only**. It carries the `never` tag, so a normal run never
+> issues certs; you trigger it explicitly with `--tags issue_client_certs`.
+> See [Per-client certificate issuance](#per-client-certificate-issuance).
 
 ---
 
@@ -32,7 +38,7 @@ Three plays in order (`playbook-install-natssl.yml`):
 ```
 ansible/
 ├── ansible.cfg                      # inventory=inventory/hosts.ini, roles_path=roles, become
-├── playbook-install-natssl.yml      # three plays: common → master → clients
+├── playbook-install-natssl.yml      # plays: common → master → clients → (opt) issue
 ├── inventory/
 │   └── hosts.ini                    # groups natssl_master / natssl_clients
 ├── group_vars/
@@ -49,12 +55,15 @@ ansible/
     │   └── templates/
     │       ├── config.master.yaml.j2
     │       └── natssl-master.service.j2
-    └── natssl_client/
-        ├── tasks/main.yml           # resolve master → render (pin) → enroll
-        ├── handlers/main.yml        # reload systemd / restart natssl-client
-        └── templates/
-            ├── config.client.yaml.j2
-            └── natssl-client.service.j2
+    ├── natssl_client/
+    │   ├── tasks/main.yml           # resolve master → render (pin) → enroll
+    │   ├── handlers/main.yml        # reload systemd / restart natssl-client
+    │   └── templates/
+    │       ├── config.client.yaml.j2
+    │       └── natssl-client.service.j2
+    └── natssl_issue/                # OPTIONAL, tag-gated: per-client issuance + delivery
+        ├── defaults/main.yml        # subject mode, reissue flag, delivery toggle/dir
+        └── tasks/main.yml           # issue on master (serial) → slurp → copy to client
 ```
 
 ---
@@ -95,6 +104,12 @@ ansible_user=root
 > The **`natssl_master` group must contain exactly one host** — the client takes it
 > as `groups['natssl_master'][0]`.
 
+> 🔎 **For issuance by hostname (Play 4):** NATSSL refuses dot-less DNS names. A subject
+> is accepted only if it is an **IP**, or an FQDN that contains a dot / ends in
+> `.local` / `.internal`. So `node-1` is **not** issuable by name — use the IP
+> (default) or rename the host to e.g. `node-1.internal`. See
+> [Per-client certificate issuance](#per-client-certificate-issuance).
+
 ---
 
 ## Variables
@@ -121,6 +136,19 @@ The downloaded asset name is assembled as:
 natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}.tar.gz
 # e.g. natssl-1.0.8-oss-linux-amd64.tar.gz
 ```
+
+### `roles/natssl_issue/defaults/main.yml` — issuance
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `natssl_client_cert_subject` | `ip` | what to use as the cert subject per client: `ip` (= `ansible_host`), `hostname` (= `inventory_hostname`, FQDN only), or `both` |
+| `natssl_reissue` | `false` | when `true`, drops idempotency and **re-issues** (overwrites) the cert/key on the master — use for rotation |
+| `natssl_deliver_certs` | `true` | copy the issued `.crt`/`.key` from the master back onto the client itself |
+| `natssl_client_issued_dir` | `{{ natssl_data_dir }}/issued` | where on the **client** delivered leaf certs are placed (`0700`) |
+
+> Subjects are auto-derived from the `[natssl_clients]` group — **nothing to type by
+> hand**. With `subject=hostname`/`both`, dot-less names (like `node-1`) are skipped
+> with a warning instead of failing the run.
 
 ### `group_vars/vault.yml` — secret (must be encrypted)
 
@@ -195,6 +223,64 @@ ansible-playbook playbook-install-natssl.yml -l node-3 --ask-vault-pass
 
 ---
 
+## Per-client certificate issuance
+
+(`natssl_issue`) issues a leaf certificate **on the master** for every host in
+`[natssl_clients]`, then optionally delivers the `.crt`/`.key` back to the client. It is
+designed to run **after a successful deploy** of the master and all clients.
+
+Key properties:
+
+- **Tag-gated** — the play carries `never`, so it runs **only** when you pass
+  `--tags issue_client_certs`. A normal deploy never issues certs.
+- **Zero manual subjects** — the target list comes straight from the
+  `[natssl_clients]` group (`ansible_host` / `inventory_hostname`).
+- **Strictly sequential** — `serial: 1` means one host is fully processed before the
+  next; the delegated `--issue` commands on the master run host-by-host.
+- **Idempotent** — uses `creates:` on the master's `issued/<subject>.crt`. Re-runs do
+  nothing unless you ask for a reissue.
+
+```bash
+# Issue + deliver (by IP, idempotent):
+ansible-playbook playbook-install-natssl.yml \
+  --ask-vault-pass --tags issue_client_certs
+
+# Deploy AND issue in one run:
+ansible-playbook playbook-install-natssl.yml \
+  --ask-vault-pass --tags all,issue_client_certs
+
+# REISSUE (rotation) — overwrite certs on the master and redeliver:
+ansible-playbook playbook-install-natssl.yml \
+  --ask-vault-pass --tags issue_client_certs -e natssl_reissue=true
+
+# Issue without delivery (keep files on the master only):
+ansible-playbook playbook-install-natssl.yml \
+  --ask-vault-pass --tags issue_client_certs -e natssl_deliver_certs=false
+
+# Issue by FQDN hostname (+ IP) — hosts must be FQDNs (e.g. nas.internal):
+ansible-playbook playbook-install-natssl.yml \
+  --ask-vault-pass --tags issue_client_certs -e natssl_client_cert_subject=both
+```
+
+**Where files land**
+
+- On the **master**: `/var/lib/natssl/issued/<subject>.crt` (`0644`) and `<subject>.key`
+  (`0600`); the issuance is also recorded in sqlite and the encrypted cache is rebuilt.
+- On the **client** (if `natssl_deliver_certs=true`): the same pair under
+  `natssl_client_issued_dir` (default `/var/lib/natssl/issued`), `.key` as `0600`,
+  `.crt` as `0644`. Delivery is done via `slurp` → `copy` (in-memory, nothing is left
+  on the control node).
+
+> 🔁 **Rotation note:** leaf certs are valid for 90 days. Because of `creates:`, an
+> expired cert is **not** renewed automatically — always rotate with
+> `-e natssl_reissue=true`.
+
+> ⛔ **Dot-less hostnames** (`node-1`) are rejected by NATSSL for issuance. With
+> `subject=ip` (default) this is a non-issue. With `hostname`/`both` such names are
+> skipped with a warning; rename to `node-1.internal` to issue by name.
+
+---
+
 ## Bootstrap and fingerprint flow
 
 ```
@@ -214,6 +300,11 @@ ansible-playbook playbook-install-natssl.yml -l node-3 --ask-vault-pass
          → render config.client.yaml  ← PIN fingerprint + recovery key + token
          → install unit
          → start natssl-client  (installs CA, enroll, periodic pull)
+                     │
+                     ▼ (optional, --tags issue_client_certs)
+[issue]  for each client (serial:1):
+         → natssl --issue <ip|fqdn>  ON THE MASTER  (creates: issued/<subject>.crt)
+         → slurp .crt/.key from master → copy onto the client
 ```
 
 Bootstrap idempotency is ensured by `creates: {{ natssl_data_dir }}/root-ca.crt` —
@@ -231,6 +322,7 @@ existing config before rendering).
 | 24-word seed | bootstrap task output | **offline only**, the playbook does not write it to disk |
 | `recovery_public_key` | `/etc/natssl/config.yaml` (master) | public — not a secret, but needed for DR |
 | Root CA + key + sqlite | `/var/lib/natssl` (`0700`) | back it up! this is your CA |
+| Issued leaf `.key` | `/var/lib/natssl/issued/*.key` (`0600`) | private keys of leaf certs — treat as secret |
 
 Back up the CA from the master:
 ```bash
@@ -258,6 +350,16 @@ ansible natssl_master -b -m shell \
   -a "openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256"
 ```
 
+Bulk issuance / rotation for all clients (preferred over ad-hoc — sequential & idempotent):
+```bash
+# issue for everyone in [natssl_clients]
+ansible-playbook playbook-install-natssl.yml --ask-vault-pass --tags issue_client_certs
+
+# rotate everyone
+ansible-playbook playbook-install-natssl.yml --ask-vault-pass \
+  --tags issue_client_certs -e natssl_reissue=true
+```
+
 Service status:
 ```bash
 ansible natssl_master  -b -m command -a "systemctl status natssl-master --no-pager"
@@ -273,7 +375,7 @@ Version upgrade: bump `natssl_release_tag` / `natssl_pkg_version` in
 ## Troubleshooting
 
 <details>
-<summary><b>Client: empty <code>master_fingerprint</code> in the config</b></summary>
+<summary>Client: empty master_fingerprint in the config</summary>
 
 The `natssl_master_fingerprint` fact is gathered **only** in the master play. Run the
 full `playbook-install-natssl.yml`, not `roles/natssl_client` in isolation.
@@ -281,7 +383,7 @@ Check that `natssl_master` has exactly one host and that `root-ca.crt` exists.
 </details>
 
 <details>
-<summary><b>Binary download fails (404 / no network)</b></summary>
+<summary>Binary download fails (404 / no network)</summary>
 
 Check that the asset
 `natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}.tar.gz` actually exists in
@@ -290,7 +392,7 @@ tarballs on an internal HTTP server and override `natssl_download_base`.
 </details>
 
 <details>
-<summary><b>"the seed is no longer shown"</b></summary>
+<summary>"the seed is no longer shown"</summary>
 
 This is by design: bootstrap runs once (`creates: root-ca.crt`). If the seed wasn't
 recorded — the only recovery path is via `recovery_public_key` / the DR procedure
@@ -299,10 +401,26 @@ for all clients.
 </details>
 
 <details>
-<summary><b>certutil/NSS won't install</b></summary>
+<summary>certutil/NSS won't install</summary>
 
 The role installs `libnss3-tools` (Debian/Ubuntu) or `nss-tools` (RHEL). If the package
 isn't found — check the repositories/proxy on the target host.
+</details>
+
+<details>
+<summary>Issuance: "target not allowed for issuance" / hostname skipped</summary>
+
+NATSSL refuses dot-less DNS names. Issue by **IP** (`natssl_client_cert_subject=ip`,
+the default), or give clients an FQDN (`node-1.internal`) and use
+`subject=hostname`/`both`. Dot-less names are skipped with a warning, not a failure.
+</details>
+
+<details>
+<summary>Issuance: cert exists but isn't refreshed</summary>
+
+The issue task is idempotent via `creates:`. To re-issue/rotate (incl. expired certs),
+run with `-e natssl_reissue=true` — this overwrites the cert/key on the master and
+redelivers to the client.
 </details>
 
 ---
@@ -312,3 +430,4 @@ isn't found — check the repositories/proxy on the target host.
 - The project's main [`README.md`](../README.md)
 - [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) — manual deployment and the security model
 - systemd units: [`natssl-master.service`](../natssl-master.service), [`natssl-client.service`](../natssl-client.service)
+````
