@@ -1,4 +1,3 @@
-````markdown
 # NATSSL — Ansible
 
 Automated deployment of [NATSSL](https://github.com/iskyneon/natssl) onto your
@@ -137,7 +136,7 @@ natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}.tar.gz
 # e.g. natssl-1.0.8-oss-linux-amd64.tar.gz
 ```
 
-### `roles/natssl_issue/defaults/main.yml` — issuance
+### `roles/natssl_issue/defaults/main.yml` — issuance (Play 4 only)
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -225,7 +224,7 @@ ansible-playbook playbook-install-natssl.yml -l node-3 --ask-vault-pass
 
 ## Per-client certificate issuance
 
-(`natssl_issue`) issues a leaf certificate **on the master** for every host in
+Play 4 (`natssl_issue`) issues a leaf certificate **on the master** for every host in
 `[natssl_clients]`, then optionally delivers the `.crt`/`.key` back to the client. It is
 designed to run **after a successful deploy** of the master and all clients.
 
@@ -430,4 +429,3 @@ redelivers to the client.
 - The project's main [`README.md`](../README.md)
 - [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) — manual deployment and the security model
 - systemd units: [`natssl-master.service`](../natssl-master.service), [`natssl-client.service`](../natssl-client.service)
-````
