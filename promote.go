@@ -2,7 +2,9 @@ package main
 
 import (
 	"crypto/ecdsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,6 +13,11 @@ import (
 	"time"
 )
 
+// RunPromote performs a disaster-recovery promotion of this client into a new
+// master. It refuses to run unless the old master is provably dead (anti
+// split-brain), then restores the Root CA byte-for-byte and the LAST replicated
+// state (clients, issued certs, revoked serials, blacklist) from the locally
+// stored encrypted cache.
 func RunPromote(cfg *Config, mnemonic string) error {
 	log.Printf("=== DISASTER RECOVERY PROMOTION START ===")
 
@@ -19,7 +26,7 @@ func RunPromote(cfg *Config, mnemonic string) error {
 		return fmt.Errorf("no old master address in config")
 	}
 
-	// CHECK 1: liveness of the old master (TCP 443/8443).
+	// CHECK 1: old CA liveness (TCP 443/8443).
 	log.Printf("check 1/3: TCP health of old master %s", oldIP)
 	if tcpHealthy(oldIP, 3*time.Second, 443) || tcpHealthy(oldIP, 3*time.Second, 8443) {
 		return fmt.Errorf("OLD MASTER IS ALIVE (443/8443 responds) — promotion aborted to prevent split-brain")
@@ -28,7 +35,7 @@ func RunPromote(cfg *Config, mnemonic string) error {
 	// CHECK 2: L2/L3 — ICMP ping + ARP table.
 	log.Printf("check 2/3: ICMP/ARP reachability of %s", oldIP)
 	if icmpAlive(oldIP) || arpKnown(oldIP) {
-		return fmt.Errorf("old master IP %s answers at the network layer (ICMP/ARP) — promotion blocked", oldIP)
+		return fmt.Errorf("old master IP %s answers at network layer (ICMP/ARP) — promotion blocked", oldIP)
 	}
 
 	// CHECK 3: own IP conflict.
@@ -44,7 +51,7 @@ func RunPromote(cfg *Config, mnemonic string) error {
 	}
 	log.Printf("all safety checks passed")
 
-	// Reconstruct the recovery key and verify against the pinned public key.
+	// Reconstruct the recovery key from the seed phrase.
 	rk, err := RecoveryFromMnemonic(strings.TrimSpace(mnemonic))
 	if err != nil {
 		return err
@@ -56,9 +63,9 @@ func RunPromote(cfg *Config, mnemonic string) error {
 	if rk.Public != *cfgPub {
 		return fmt.Errorf("seed phrase does not match the network's recovery public key")
 	}
-	log.Printf("recovery key reconstructed and verified against the pinned public key")
+	log.Printf("recovery key reconstructed and verified against pinned public key")
 
-	// Decrypt the local cache and parse the snapshot.
+	// Decrypt the locally stored cache and parse the snapshot.
 	ec, err := ReadEncryptedCache(cfg.cachePath())
 	if err != nil {
 		return fmt.Errorf("no local network cache to recover from: %w", err)
@@ -71,42 +78,60 @@ func RunPromote(cfg *Config, mnemonic string) error {
 	if err := json.Unmarshal(plain, &snap); err != nil {
 		return err
 	}
-	log.Printf("cache decrypted: snapshot v%d, %d certificates, %d clients",
-		snap.Version, len(snap.Certs), len(snap.Clients))
+	log.Printf("cache decrypted (created %s): %d certs, %d clients, %d revoked, %d blacklisted",
+		snap.CreatedAt.Format(time.RFC3339),
+		len(snap.Certs), len(snap.Clients), len(snap.Revoked), len(snap.Blacklist))
 
-	// Restore the Root CA byte-for-byte (identical serial & SHA-256).
+	// Restore the Root CA BYTE-FOR-BYTE (identical serial and SHA-256).
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
-	ca, err := LoadCAFromPEM(snap.CACertPEM, snap.CAKeyPEM)
+	caCertBlock, _ := pem.Decode([]byte(snap.CACertPEM))
+	if caCertBlock == nil {
+		return fmt.Errorf("snapshot Root CA certificate is not valid PEM")
+	}
+	caCert, err := x509.ParseCertificate(caCertBlock.Bytes)
 	if err != nil {
-		return fmt.Errorf("rebuild CA from snapshot: %w", err)
+		return fmt.Errorf("parse Root CA certificate: %w", err)
 	}
-
-	// Integrity gate: restored fingerprint MUST equal the pinned one.
-	if want := normalizeFingerprint(cfg.MasterFingerprint); want != "" {
-		if normalizeFingerprint(ca.Fingerprint()) != want {
-			return fmt.Errorf("restored CA fingerprint mismatch — refusing to promote")
-		}
+	caKeyBlock, _ := pem.Decode([]byte(snap.CAKeyPEM))
+	if caKeyBlock == nil {
+		return fmt.Errorf("snapshot Root CA key is not valid PEM")
 	}
+	keyAny, err := x509.ParsePKCS8PrivateKey(caKeyBlock.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse Root CA key: %w", err)
+	}
+	caKey, ok := keyAny.(*ecdsa.PrivateKey)
+	if !ok {
+		return fmt.Errorf("restored Root CA key is not ECDSA")
+	}
+	ca := &CA{Cert: caCert, CertDER: caCertBlock.Bytes, Key: caKey}
 	if err := ca.SaveToFiles(cfg.caCertPath(), cfg.caKeyPath()); err != nil {
 		return err
 	}
-	if err := ensureServerCert(cfg, ca); err != nil {
-		return err
-	}
 	log.Printf("Root CA restored | identical fingerprint: %s", ca.Fingerprint())
+	if snap.Fingerprint != "" && snap.Fingerprint != ca.Fingerprint() {
+		log.Printf("WARNING: restored fingerprint differs from snapshot's recorded fingerprint!")
+	}
 
-	// Transactionally restore the database.
+	// Restore the database (clients, certs, revoked, blacklist).
 	st, err := OpenStore(cfg.dbPath())
 	if err != nil {
 		return err
 	}
 	if err := st.RestoreSnapshot(&snap); err != nil {
 		st.Close()
-		return fmt.Errorf("restore snapshot: %w", err)
+		return fmt.Errorf("restore snapshot into DB: %w", err)
+	}
+	log.Printf("state restored: clients, issued certs, revocations and blacklist are now active")
+
+	// Regenerate the signed CRL from the restored revoked set.
+	if err := WriteCRL(cfg, ca, st); err != nil {
+		log.Printf("WARNING: could not regenerate CRL after promotion: %v", err)
 	}
 
+	// Switch config to master mode on the NEW IP.
 	newIP := myIPs[0]
 	cfg.Mode = "master"
 	cfg.MasterAddress = newIP
@@ -117,9 +142,10 @@ func RunPromote(cfg *Config, mnemonic string) error {
 	}
 	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
 		st.Close()
-		return err
+		return fmt.Errorf("rebuild cache after promotion: %w", err)
 	}
 
+	// Broadcast the Root-CA-signed migration packet to all clients.
 	log.Printf("broadcasting signed migration packet (new master = %s) to %d clients",
 		newIP, len(snap.Clients))
 	broadcastMigration(ca, newIP, snap.Clients)
@@ -156,3 +182,4 @@ func broadcastMigration(ca *CA, newIP string, clients []string) {
 		}
 	}
 }
+

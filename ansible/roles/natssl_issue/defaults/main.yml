@@ -6,7 +6,7 @@
 natssl_client_cert_subject: "ip"
 
 # Перевыпуск: при true убирает идемпотентность (creates) и заставляет
-# мастер перезаписать существующий серт/ключ. Включается через:
+# мастер перезаписать существующий серт/ключ. Включается так:
 #   --tags issue_client_certs -e natssl_reissue=true
 natssl_reissue: false
 

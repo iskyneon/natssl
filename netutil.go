@@ -9,11 +9,11 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
 
+// host strips an optional :port (and brackets) from an address.
 func host(addr string) string {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -25,14 +25,11 @@ func host(addr string) string {
 	return strings.Trim(addr, "[]")
 }
 
-func ipsToStr(ips []net.IP) []string {
-	out := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		out = append(out, ip.String())
-	}
-	return out
-}
+// NOTE: ipsToStr lives in ca.go (single definition). It was previously also
+// declared here, which broke the build with "ipsToStr redeclared".
 
+// tcpHealthy reports whether any of the given TCP ports on host accept a
+// connection within timeout.
 func tcpHealthy(h string, timeout time.Duration, ports ...int) bool {
 	for _, p := range ports {
 		addr := net.JoinHostPort(h, fmt.Sprintf("%d", p))
@@ -44,135 +41,89 @@ func tcpHealthy(h string, timeout time.Duration, ports ...int) bool {
 	return false
 }
 
-// insecureMasterClient is used ONLY for the signed migration broadcast
-// (master -> client :8443 /migrate). The packet body is ECDSA-signed by the
-// Root CA and verified by the receiver, so transport verification is not
-// required on this single, authenticated-by-payload path.
+// insecureMasterClient is used ONLY for master->client cache/CRL push, where
+// the payload is already AES-GCM encrypted+sealed (cache) or publicly signed
+// (CRL), and the client receiver uses an ephemeral self-signed cert.
 func insecureMasterClient() *http.Client {
 	return &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				MinVersion:         tls.VersionTLS12,
+			},
 		},
 	}
 }
 
-func rootCAPool(cfg *Config) *x509.CertPool {
-	b, err := os.ReadFile(cfg.caCertPath())
-	if err != nil {
-		return nil
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(b) {
-		return nil
-	}
-	return pool
-}
-
-// pinnedMasterClient authenticates the master over the BOOTSTRAP path (:443,
-// /ca and /acme/register) where the client has no identity cert yet.
+// pinnedMasterClient authenticates the MASTER via Root CA pinning (client->master
+// path: /ca, /cache, /crl, /acme/*).
 func pinnedMasterClient(cfg *Config) *http.Client {
 	tlsCfg := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true, // default hostname check off; pin enforced below
+		InsecureSkipVerify: true, // hostname check disabled; pin enforced below
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			return verifyMasterPin(cfg, rawCerts)
 		},
 	}
-	return &http.Client{Timeout: 30 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+	}
 }
 
-// mtlsClient authenticates BOTH directions for the control plane (:8443): it
-// presents the client identity cert AND verifies the master leaf chains to the
-// pinned Root CA. Used after enrollment.
-func mtlsClient(cfg *Config) (*http.Client, error) {
-	cert, err := tls.LoadX509KeyPair(cfg.clientCertPath(), cfg.clientKeyPath())
-	if err != nil {
-		return nil, fmt.Errorf("client identity not available (enroll first): %w", err)
-	}
-	pool := rootCAPool(cfg)
-	if pool == nil {
-		return nil, fmt.Errorf("local Root CA missing")
-	}
-	tlsCfg := &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		Certificates:       []tls.Certificate{cert},
-		RootCAs:            pool,
-		InsecureSkipVerify: true, // hostname check off; pin enforced below
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			return verifyMasterPin(cfg, rawCerts)
-		},
-	}
-	return &http.Client{Timeout: 30 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg}}, nil
-}
-
-// verifyMasterPin pins to the ROOT CA (not an arbitrary presented leaf) and
-// requires a valid ServerAuth chain. Order:
-//  1. master_fingerprint set -> a CA cert with that SHA-256 must be present in
-//     the chain, and the leaf must chain to it.
-//  2. else -> the leaf must chain to the locally installed Root CA.
-//  3. else -> fail closed.
+// verifyMasterPin enforces Root CA pinning for the master connection.
 func verifyMasterPin(cfg *Config, rawCerts [][]byte) error {
 	if len(rawCerts) == 0 {
 		return fmt.Errorf("master presented no certificate")
 	}
-	certs := make([]*x509.Certificate, 0, len(rawCerts))
-	for _, der := range rawCerts {
-		c, err := x509.ParseCertificate(der)
-		if err != nil {
-			return fmt.Errorf("parse presented cert: %w", err)
-		}
-		certs = append(certs, c)
-	}
-	leaf := certs[0]
 
-	roots := x509.NewCertPool()
 	if want := normalizeFingerprint(cfg.MasterFingerprint); want != "" {
-		var pinned *x509.Certificate
-		for _, c := range certs {
-			if normalizeFingerprint(certFingerprint(c.Raw)) == want {
-				pinned = c
-				break
+		for _, der := range rawCerts {
+			if certFingerprint(der) == want {
+				return nil
 			}
 		}
-		if pinned == nil {
-			return fmt.Errorf("no certificate in chain matches pinned root fingerprint %s…", shorten(want))
-		}
-		if !pinned.IsCA {
-			return fmt.Errorf("pinned certificate is not a CA — refusing")
-		}
-		roots.AddCert(pinned)
-	} else if p := rootCAPool(cfg); p != nil {
-		roots = p
-	} else {
-		return fmt.Errorf("cannot verify master: set master_fingerprint or install the Root CA first")
+		return fmt.Errorf("master certificate fingerprint mismatch (expected %s…)", shorten(want))
 	}
 
-	inter := x509.NewCertPool()
-	for _, c := range certs[1:] {
-		inter.AddCert(c)
+	if caPEM, err := os.ReadFile(cfg.caCertPath()); err == nil {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return fmt.Errorf("local Root CA file is not valid PEM")
+		}
+		leaf, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("parse master certificate: %w", err)
+		}
+		inter := x509.NewCertPool()
+		for _, der := range rawCerts[1:] {
+			if c, e := x509.ParseCertificate(der); e == nil {
+				inter.AddCert(c)
+			}
+		}
+		if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, Intermediates: inter}); err != nil {
+			return fmt.Errorf("master certificate does not chain to local Root CA: %w", err)
+		}
+		return nil
 	}
-	if _, err := leaf.Verify(x509.VerifyOptions{
-		Roots:         roots,
-		Intermediates: inter,
-		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}); err != nil {
-		return fmt.Errorf("master leaf does not chain to pinned Root CA: %w", err)
-	}
-	return nil
+
+	return fmt.Errorf("cannot verify master: set master_fingerprint in config " +
+		"or install the Root CA locally first")
 }
 
+// certFingerprint returns the lowercase, colon-free hex SHA-256 of a DER cert.
 func certFingerprint(der []byte) string {
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:])
 }
 
+// normalizeFingerprint lowercases and strips ':' and spaces.
 func normalizeFingerprint(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, ":", "")
-	return strings.ReplaceAll(s, " ", "")
+	s = strings.ReplaceAll(s, " ", "")
+	return s
 }
 
 func shorten(s string) string {
@@ -182,28 +133,3 @@ func shorten(s string) string {
 	return s
 }
 
-// writeFileAtomic writes via a temp file + rename (durable, no torn files).
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".natssl-tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
-}

@@ -52,7 +52,7 @@
   ansible.builtin.command:
     cmd: >-
       {{ natssl_bin }} --mode=master
-      --issue '{{ item }}'
+      {{ '--reissue' if natssl_reissue | bool else '--issue' }} '{{ item }}'
       --config {{ natssl_conf_file }}
     creates: >-
       {{ omit if natssl_reissue | bool
@@ -90,7 +90,6 @@
       {{ natssl_client_issued_dir }}/{{ item.item.0 | regex_replace('[*/:\\\\]', '_') }}{{ item.item.1 }}
     owner: root
     group: root
-    # .key -> 0600, .crt -> 0644
     mode: "{{ '0600' if item.item.1 == '.key' else '0644' }}"
   loop: "{{ _natssl_files.results | default([]) }}"
   loop_control:
