@@ -1,4 +1,4 @@
-VERSION ?= 1.0.10-oss
+VERSION ?= 1.0.11-oss
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 DATE    := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BINARY  := natssl

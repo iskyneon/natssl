@@ -94,32 +94,32 @@ and issued certificates — it is never used as an online TLS key.
 ## Download
 
 Get prebuilt binaries from the [latest release](https://github.com/iskyneon/natssl/releases/latest).
-The [1.0.10 release](https://github.com/iskyneon/natssl/releases/tag/1.0.10) includes:
+The [1.0.11 release](https://github.com/iskyneon/natssl/releases/tag/1.0.11) includes:
 
 | Platform | Architecture | Download |
 |---|---|---|
-| Linux | amd64 (x86-64) | [natssl-1.0.10-oss-linux-amd64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-1.0.10-oss-linux-amd64.tar.gz) |
-| Linux | arm64 (aarch64) | [natssl-1.0.10-oss-linux-arm64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-1.0.10-oss-linux-arm64.tar.gz) |
-| macOS | amd64 (Intel) | [natssl-1.0.10-oss-darwin-amd64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-1.0.10-oss-darwin-amd64.tar.gz) |
-| macOS | arm64 (Apple Silicon) | [natssl-1.0.10-oss-darwin-arm64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-1.0.10-oss-darwin-arm64.tar.gz) |
+| Linux | amd64 (x86-64) | [natssl-1.0.11-oss-linux-amd64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.11/natssl-1.0.11-oss-linux-amd64.tar.gz) |
+| Linux | arm64 (aarch64) | [natssl-1.0.11-oss-linux-arm64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.11/natssl-1.0.11-oss-linux-arm64.tar.gz) |
+| macOS | amd64 (Intel) | [natssl-1.0.11-oss-darwin-amd64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.11/natssl-1.0.11-oss-darwin-amd64.tar.gz) |
+| macOS | arm64 (Apple Silicon) | [natssl-1.0.11-oss-darwin-arm64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.11/natssl-1.0.11-oss-darwin-arm64.tar.gz) |
 
-[Source archive](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-src-1.0.10.tar.gz)
-· [SHA256SUMS.txt](https://github.com/iskyneon/natssl/releases/download/1.0.10/SHA256SUMS.txt)
+[Source archive](https://github.com/iskyneon/natssl/releases/download/1.0.11/natssl-src-1.0.11.tar.gz)
+· [SHA256SUMS.txt](https://github.com/iskyneon/natssl/releases/download/1.0.11/SHA256SUMS.txt)
 
 Verify the downloaded archive before extracting it:
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS.txt  # Linux
 # macOS example (Apple Silicon); use your archive's filename:
-grep '  natssl-1.0.10-oss-darwin-arm64.tar.gz$' SHA256SUMS.txt | shasum -a 256 -c -
+grep '  natssl-1.0.11-oss-darwin-arm64.tar.gz$' SHA256SUMS.txt | shasum -a 256 -c -
 ```
 
 Native binaries include master and client modes. The
 [GHCR image](https://github.com/iskyneon/natssl/pkgs/container/natssl) is
-**client-only**, for Linux amd64/arm64:
+**master-only**, for Linux amd64/arm64:
 
 ```bash
-docker pull ghcr.io/iskyneon/natssl:1.0.10
+docker pull ghcr.io/iskyneon/natssl:1.0.11
 ```
 
 ---
@@ -136,10 +136,10 @@ Output:
 
 ```
 dist/
-├── natssl-1.0.10-oss-linux-amd64.tar.gz
-├── natssl-1.0.10-oss-linux-arm64.tar.gz
-├── natssl-1.0.10-oss-darwin-amd64.tar.gz
-├── natssl-1.0.10-oss-darwin-arm64.tar.gz
+├── natssl-1.0.11-oss-linux-amd64.tar.gz
+├── natssl-1.0.11-oss-linux-arm64.tar.gz
+├── natssl-1.0.11-oss-darwin-amd64.tar.gz
+├── natssl-1.0.11-oss-darwin-arm64.tar.gz
 └── SHA256SUMS.txt
 ```
 
@@ -152,8 +152,8 @@ Pack the source tree:
 Install:
 
 ```bash
-tar -xzf natssl-1.0.10-oss-linux-amd64.tar.gz
-sudo install -m 0755 natssl-1.0.10-oss-linux-amd64 /usr/local/bin/natssl
+tar -xzf natssl-1.0.11-oss-linux-amd64.tar.gz
+sudo install -m 0755 natssl-1.0.11-oss-linux-amd64 /usr/local/bin/natssl
 natssl --version
 ```
 
@@ -478,13 +478,15 @@ local encrypted cache. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
-## Client-only container
+## Master-only container
 
-The GHCR image runs the client by default and rejects master mode, bootstrap and
-promotion. Use native binaries or Ansible for the master. See
-[docker/README.md](docker/README.md) for persistent state, host trust and
-multi-platform image usage. Native client trust installation can be disabled
-with `install_trust: false`; it remains enabled by default outside client-only builds.
+The GHCR image runs **only master mode**, by default. Master bootstrap and
+administrative commands are supported; client mode, client configs and promotion
+are rejected in the compiled binary, independently of Docker arguments.
+Use the full native binaries or Ansible for clients. See
+[docker/README.md](docker/README.md) for bootstrap, persistent CA state,
+external TLS names and multi-platform image usage. Native client trust
+installation can be disabled with `install_trust: false`; it is enabled by default.
 
 ## Development checks
 

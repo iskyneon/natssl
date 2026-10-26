@@ -160,11 +160,12 @@ Idempotent via `creates:`. Use `-e natssl_reissue=true` to revoke + reissue.
 
 ## Version and protocol compatibility
 
-The default native release is **1.0.10** (`natssl_release_tag`); its package
+The default native release is **1.0.11** (`natssl_release_tag`); its package
 version is derived automatically. Downloads are verified against the release's
 `SHA256SUMS.txt` before extraction. Installing a changed binary restarts the
 corresponding service. Native master/client binaries support both roles; the
-GHCR image is client-only and is not used by these native systemd roles.
+GHCR image is master-only. These systemd roles deploy full native binaries
+for both master and clients; they do not install the container image.
 
 `group_vars/vault.yml` is explicitly loaded by the master/client plays. Put the
 same `natssl_enrollment_token` there and encrypt it with `ansible-vault encrypt`.

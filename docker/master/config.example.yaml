@@ -1,0 +1,13 @@
+mode: master
+data_dir: /var/lib/natssl
+listen:
+  acme: ":9443" # published as host port 443; no bind capability required
+  mgmt: ":8443"
+# Replace with every host IP/DNS name that clients use to reach this master.
+server_names: ["192.168.10.5"]
+recovery_public_key: "" # populated by the one-time bootstrap
+# Generate with: openssl rand -hex 32
+enrollment_token: "REPLACE_ME"
+client_networks:
+  - "192.168.10.0/24"
+pull_interval: 1h

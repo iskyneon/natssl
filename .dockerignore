@@ -10,3 +10,5 @@ docker/client/config.yaml
 docker/.env
 docker/data
 ansible/group_vars/vault.yml
+
+docker/master/config.yaml
