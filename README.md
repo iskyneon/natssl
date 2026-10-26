@@ -4,7 +4,7 @@
   <img src="assets/natssl.png" alt="NATSSL logo" width="260">
 </p>
 <p align="center">
-**Zero-Configuration Distributed TLS for Private Infrastructure.**
+Zero-Configuration Distributed TLS for Private Infrastructure.
 </p>
 A single binary acting as a Certificate Authority (Root CA) for private
 networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
