@@ -3,15 +3,14 @@
 <p align="center">
   <img src="assets/natssl.png" alt="NATSSL logo" width="260">
 </p>
-
+<p align="center">
 **Zero-Configuration Distributed TLS for Private Infrastructure.**
-
+</p>
 A single binary acting as a Certificate Authority (Root CA) for private
 networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
 no cloud.
 
 [![release](https://img.shields.io/github/v/release/iskyneon/natssl?label=version&color=blue)](https://github.com/iskyneon/natssl/releases/latest)
-[![CI](https://github.com/iskyneon/natssl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/iskyneon/natssl/actions/workflows/ci.yml)
 ![platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-informational)
 ![architecture](https://img.shields.io/badge/architecture-amd64%20%7C%20arm64-informational)
 
