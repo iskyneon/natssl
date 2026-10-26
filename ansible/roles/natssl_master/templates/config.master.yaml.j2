@@ -1,13 +1,10 @@
 mode: master
-data_dir: {{ natssl_data_dir }}
+data_dir: {{ natssl_data_dir | to_json }}
 listen:
-  acme: "{{ natssl_acme_listen }}"
-  mgmt: "{{ natssl_mgmt_listen }}"
-recovery_public_key: "{{ natssl_recovery_public_key | default('') }}"
-enrollment_token: "{{ natssl_enrollment_token }}"
-client_networks:
-{% for cidr in natssl_client_networks %}
-  - "{{ cidr }}"
-{% endfor %}
-pull_interval: {{ natssl_pull_interval }}
-
+  acme: {{ natssl_acme_listen | to_json }}
+  mgmt: {{ natssl_mgmt_listen | to_json }}
+server_names: {{ ([inventory_hostname] + natssl_server_names) | unique | list | to_json }}
+recovery_public_key: {{ natssl_recovery_public_key | default('') | to_json }}
+enrollment_token: {{ natssl_enrollment_token | to_json }}
+client_networks: {{ natssl_client_networks | to_json }}
+pull_interval: {{ natssl_pull_interval | to_json }}

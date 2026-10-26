@@ -1,0 +1,12 @@
+.git
+.codex
+.agents
+dist
+natssl
+natssl-src*.tar.gz
+**/__pycache__
+**/.pytest_cache
+docker/client/config.yaml
+docker/.env
+docker/data
+ansible/group_vars/vault.yml

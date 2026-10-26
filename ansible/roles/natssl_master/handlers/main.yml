@@ -1,6 +1,8 @@
 ---
 - name: reload systemd
   ansible.builtin.systemd: { daemon_reload: true }
+  when: natssl_manage_services | bool
 - name: restart natssl-master
   ansible.builtin.systemd: { name: natssl-master, state: restarted }
+  when: natssl_manage_services | bool
 

@@ -1,3 +1,5 @@
+//go:build !clientonly
+
 package main
 
 import (

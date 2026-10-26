@@ -1,14 +1,36 @@
 [Unit]
 Description=NATSSL Master (Private CA)
+Documentation=https://github.com/iskyneon/natssl
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+Type=simple
 ExecStart={{ natssl_bin }} --mode=master --config={{ natssl_conf_file }}
 Restart=on-failure
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+RestartSec=3s
+
+# The master binds :443; it does NOT use raw sockets (no ICMP on this path),
+# so CAP_NET_BIND_SERVICE is the only privilege required.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
+
+# The Ansible common role creates data_dir before this service starts.
+
+# Filesystem hardening: only the data dir is writable.
+ProtectSystem=strict
+ReadWritePaths={{ natssl_data_dir }}
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Networking surface.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target
-

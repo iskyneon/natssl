@@ -1,0 +1,4 @@
+docker/.env
+docker/client/config.yaml
+docker/data/
+**/__pycache__/

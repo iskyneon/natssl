@@ -18,6 +18,7 @@ type Listen struct {
 
 // Config is the on-disk configuration shared by master and client modes.
 type Config struct {
+	InstallTrust      bool          `yaml:"install_trust"`          // install OS/Firefox trust anchors (native default true)
 	Mode              string        `yaml:"mode"`                   // master | client
 	DataDir           string        `yaml:"data_dir"`               // /var/lib/natssl
 	Listen            Listen        `yaml:"listen"`                 // ports
@@ -38,8 +39,13 @@ type Config struct {
 
 // DefaultConfig returns a config with safe defaults.
 func DefaultConfig() *Config {
+	mode := "master"
+	if clientOnly {
+		mode = "client"
+	}
 	return &Config{
-		Mode:         "master",
+		Mode:         mode,
+		InstallTrust: !clientOnly,
 		DataDir:      "/var/lib/natssl",
 		Listen:       Listen{ACME: ":443", Mgmt: ":8443"},
 		PullInterval: time.Hour,

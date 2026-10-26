@@ -6,7 +6,7 @@ A single binary acting as a Certificate Authority (Root CA) for private
 networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
 no cloud.
 
-![status](https://img.shields.io/badge/version-1.0.9--oss-blue)
+![status](https://img.shields.io/badge/version-1.0.10--oss-blue)
 ![platform](https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational)
 
 ---
@@ -95,10 +95,10 @@ Output:
 
 ```
 dist/
-├── natssl-1.0.9-oss-linux-amd64.tar.gz
-├── natssl-1.0.9-oss-linux-arm64.tar.gz
-├── natssl-1.0.9-oss-darwin-amd64.tar.gz
-├── natssl-1.0.9-oss-darwin-arm64.tar.gz
+├── natssl-1.0.10-oss-linux-amd64.tar.gz
+├── natssl-1.0.10-oss-linux-arm64.tar.gz
+├── natssl-1.0.10-oss-darwin-amd64.tar.gz
+├── natssl-1.0.10-oss-darwin-arm64.tar.gz
 └── SHA256SUMS.txt
 ```
 
@@ -111,8 +111,8 @@ Pack the source tree:
 Install:
 
 ```bash
-tar -xzf natssl-1.0.9-oss-linux-amd64.tar.gz
-sudo install -m 0755 natssl-1.0.9-oss-linux-amd64 /usr/local/bin/natssl
+tar -xzf natssl-1.0.10-oss-linux-amd64.tar.gz
+sudo install -m 0755 natssl-1.0.10-oss-linux-amd64 /usr/local/bin/natssl
 natssl --version
 ```
 
@@ -436,6 +436,14 @@ local encrypted cache. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 | `--version` | Show version |
 
 ---
+
+## Client-only container
+
+The GHCR image runs the client by default and rejects master mode, bootstrap and
+promotion. Use native binaries or Ansible for the master. See
+[docker/README.md](docker/README.md) for persistent state, host trust and
+multi-platform image usage. Native client trust installation can be disabled
+with `install_trust: false`; it remains enabled by default outside client-only builds.
 
 ## Development checks
 

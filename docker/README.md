@@ -1,49 +1,79 @@
-# NATSSL — master-only mode docker deployment
+# NATSSL client-only container
 
-Runs the NATSSL private CA **master** (Root CA + mTLS control plane) in a container.
-Mirrors the systemd unit: same binary path, config path, data dir, ports and caps.
+`ghcr.io/iskyneon/natssl:1.0.10` runs only the **client** role, which is the
+binary's default mode. Linux amd64 and arm64 are published in one image index.
+Native release binaries are used for the master and disaster-recovery promotion.
 
-## Quick start
+The `clientonly` build policy rejects master mode, bootstrap, promotion and
+administrative commands, including when bypassing the Docker entrypoint or
+mounting a master-mode config. This restriction is independent of Compose.
 
-# 0. Enter to docker directory
-    cd docker
-    cp .env.example .env
+## Start a client
 
-# 1. Generate the enrollment token
-    openssl rand -hex 32                 # paste into master/config.yaml -> enrollment_token
+```bash
+cd docker
+cp .env.example .env
+cp client/config.example.yaml client/config.yaml
+mkdir -p data
+chmod 700 client data
+chmod 600 client/config.yaml
+```
 
-# 2. Build the image
-    docker compose build
+Set `master_address`, `master_fingerprint`, `recovery_public_key` and the shared
+`enrollment_token` from the **native master**. Set `NATSSL_UID`/`NATSSL_GID` in
+`.env` to your host user's `id -u`/`id -g`, so the container can read the private
+config and write `data/`. For custom master ports also set
+`master_mgmt_address`.
 
-# 3. ONE-TIME — bootstrap the Root CA (interactive, prints the 24-word seed!)
-    docker compose run --rm natssl-master --mode=master --bootstrap --config=/etc/natssl/config.yaml
-#   ⚠️ WRITE DOWN THE 24 WORDS OFFLINE — shown only once (recovery.go)
-#   ⚠️ recovery_public_key is auto-written into master/config.yaml
+```bash
+docker compose pull
+docker compose up -d
+docker compose ps
+docker compose logs --tail 50 natssl-client
+```
 
-# 4. Start the service
-    docker compose up -d
+For a local build use `docker compose up -d --build`. There is no ACME listener
+or CA bootstrap command in the image. Outbound HTTPS to the native master's
+443/8443 ports is sufficient for enrollment, issuance and pull replication.
 
-# 5. Verify
-    docker compose ps
-    docker compose logs -f natssl-master
+The optional inbound 8443 mapping handles **signed migration announcements
+only**, never cache/CRL push. It binds loopback by default. To receive remote
+announcements set `MGMT_BIND` to a reachable host interface and restrict access
+with the host firewall. Container promotion remains disabled.
 
+## State and host trust
 
-## Fingerprint (clients pin this)
+Config is mounted as a directory because signed migration updates use atomic
+renames. `data/` retains the pinned Root CA, private client identity, signed
+recovery cache and CRL across restarts. Keep both directories private and back
+up state; removing the container does not remove these bind mounts.
 
-    docker compose exec natssl-master \
-      sh -c 'openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256'
+The image runs as UID/GID 1000 by default with capabilities dropped in Compose.
+It does **not** install trust anchors into the host or Firefox profiles.
+`install_trust: false` is the container default. To trust the CA on the host,
+verify the exported fingerprint and install `data/root-ca.crt` using the host's
+supported trust-store tools. The normal native client keeps automatic OS/Firefox
+installation enabled by default.
 
-## Issue / revoke
+Health checks require an enrolled, valid client identity and a synchronized
+cache. An unreachable master puts the client in READ-ONLY mode; synchronized
+state is retained. New issuance requires the master.
 
-    docker compose exec natssl-master natssl --mode=master --issue "app.internal" --config=/etc/natssl/config.yaml
-    docker compose exec natssl-master natssl --mode=master --issue "172.16.1.2" --config=/etc/natssl/config.yaml
-    docker compose exec natssl-master natssl --mode=master --revoke "<serial>"     --config=/etc/natssl/config.yaml
+## Issue a loopback certificate
 
-## Notes
+```bash
+docker compose exec natssl-client natssl --issue localhost --localhost
+docker compose exec natssl-client natssl --decrypt-key=/var/lib/natssl/issued/localhost.key.enc
+```
 
-- Ports 443 (enroll/CA) and 8443 (mTLS) must be reachable from client subnets.
-- Set client_networks in master/config.yaml to the CIDRs allowed to self-enroll.
-- Root CA + sqlite live in the `natssl-master-data` volume — back it up.
-- The 24-word seed is the Disaster Recovery key: shown once, store offline.
-- Never run `docker compose down -v` in production (wipes the CA volume).
+Issuance prompts for the private-key encryption password. Decryption writes the
+PEM key to stdout; protect its destination. Domain/IP administration must run
+on the native master, not inside this image.
 
+## Publishing
+
+`.github/workflows/container.yml` smoke-tests a real image against a native
+master, checks the client-only policy and offline state retention, then publishes
+`ghcr.io/iskyneon/natssl:<version>`, `<version>-oss` and `latest` for version tags.
+Pull requests run the smoke test without publishing. A repository's existing
+GHCR package must grant that repository Actions write access.

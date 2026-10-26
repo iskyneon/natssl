@@ -1,8 +1,15 @@
 mode: client
-data_dir: {{ natssl_data_dir }}
-master_address: "{{ natssl_master_address }}"
-master_fingerprint: "{{ hostvars[_master].natssl_master_fingerprint }}"
-recovery_public_key: "{{ hostvars[_master].natssl_recovery_public_key }}"
-enrollment_token: "{{ natssl_enrollment_token }}"
-ping_interval: {{ natssl_ping_interval }}
-
+install_trust: {{ natssl_install_trust | to_json }}
+data_dir: {{ natssl_data_dir | to_json }}
+listen:
+  mgmt: {{ natssl_client_mgmt_listen | to_json }}
+master_address: {{ _natssl_master_address | to_json }}
+master_mgmt_address: {{ _natssl_master_mgmt_address | to_json }}
+master_fingerprint: {{ hostvars[_master].natssl_master_fingerprint | to_json }}
+recovery_public_key: {{ hostvars[_master].natssl_recovery_public_key | to_json }}
+enrollment_token: {{ natssl_enrollment_token | to_json }}
+pull_interval: {{ natssl_pull_interval | to_json }}
+ping_interval: {{ natssl_ping_interval | to_json }}
+{% if _natssl_last_migration %}
+last_migration: {{ _natssl_last_migration | string | to_json }}
+{% endif %}
