@@ -8,7 +8,7 @@
 
 A single binary acting as a Certificate Authority (Root CA) for private
 networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
-no cloud.
+no cloud. Made by an engineer for engineers...
 
 [![release](https://img.shields.io/github/v/release/iskyneon/natssl?label=version&color=blue)](https://github.com/iskyneon/natssl/releases/latest)
 ![platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-informational)
