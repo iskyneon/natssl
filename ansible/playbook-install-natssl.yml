@@ -1,5 +1,5 @@
 ---
-# 1) Бинарник + каталоги + зависимости на всех хостах
+# 1) Install the binary, create directories and provision dependencies on all hosts.
 - name: NATSSL — common provisioning
   hosts: natssl_master:natssl_clients
   become: true
@@ -14,7 +14,7 @@
   roles:
     - natssl_common
 
-# 2) Мастер: config -> bootstrap -> service -> экспорт fingerprint + recovery_public_key
+# 2) Master: configure -> bootstrap -> start service -> export fingerprint and recovery public key.
 - name: NATSSL — master
   hosts: natssl_master
   become: true
@@ -22,7 +22,7 @@
   roles:
     - natssl_master
 
-# 3) Клиенты: используют факты, собранные на мастере (hostvars), затем enroll
+# 3) Clients: use facts gathered from the master (hostvars), then enroll.
 - name: NATSSL — clients
   hosts: natssl_clients
   become: true
@@ -30,10 +30,10 @@
   roles:
     - natssl_client
 
-# 4) (ОПЦИОНАЛЬНО, по тегу) Выпуск сертификатов на мастере для каждого клиента
-#    + доставка .crt/.key обратно на клиент. Не выполняется в обычном прогоне.
-#    serial: 1 => строго ПОСЛЕДОВАТЕЛЬНО, хост за хостом из [natssl_clients].
-#    Перевыпуск (revoke+issue): -e natssl_reissue=true
+# 4) OPTIONAL, tag-gated: issue a certificate on the master for each client
+#    and deliver the .crt/.key files to that client. Skipped during normal runs.
+#    serial: 1 processes hosts in [natssl_clients] sequentially, one at a time.
+#    To reissue (revoke + issue), pass: -e natssl_reissue=true
 - name: NATSSL — issue per-client certificates on the master
   hosts: natssl_clients
   become: true
