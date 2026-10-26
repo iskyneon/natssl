@@ -1,37 +1,79 @@
 ---
-- name: Resolve master host & address
+- name: Resolve master and endpoint host
   ansible.builtin.set_fact:
     _master: "{{ groups['natssl_master'][0] }}"
 
-- name: Compute master_address (override with natssl_master_address)
+- name: Resolve master endpoints
   ansible.builtin.set_fact:
-    natssl_master_address: >-
-      {{ natssl_master_address
-         | default(hostvars[_master].ansible_host
-                   | default(hostvars[_master].ansible_default_ipv4.address)) }}
+    _natssl_master_host: "{{ hostvars[_master].ansible_host | default(_master) }}"
 
-- name: Render client config.yaml (pins fingerprint + token + recovery key from master)
+- name: Compute client addresses and preserve explicit overrides
+  ansible.builtin.set_fact:
+    _natssl_master_address: "{{ natssl_master_address | default(('[' ~ _natssl_master_host ~ ']' if ':' in _natssl_master_host else _natssl_master_host) ~ ':' ~ hostvars[_master].natssl_acme_listen.rsplit(':', 1)[-1]) }}"
+    _natssl_master_mgmt_address: "{{ natssl_master_mgmt_address | default(('[' ~ _natssl_master_host ~ ']' if ':' in _natssl_master_host else _natssl_master_host) ~ ':' ~ hostvars[_master].natssl_mgmt_listen.rsplit(':', 1)[-1]) }}"
+
+- name: Check existing client config
+  ansible.builtin.stat:
+    path: "{{ natssl_conf_file }}"
+  register: client_cfg_stat
+
+- name: Read existing client config
+  ansible.builtin.slurp:
+    src: "{{ natssl_conf_file }}"
+  register: client_cfg_pre
+  when: client_cfg_stat.stat.exists
+  no_log: true
+
+- name: Preserve migration replay protection
+  ansible.builtin.set_fact:
+    _natssl_last_migration: "{{ (client_cfg_pre.content | b64decode | from_yaml).last_migration | default('') if client_cfg_stat.stat.exists else '' }}"
+  no_log: true
+
+- name: Render pinned client config
   ansible.builtin.template:
     src: config.client.yaml.j2
     dest: "{{ natssl_conf_file }}"
-    owner: root
-    group: root
-    mode: "0600"
+    owner: "{{ natssl_file_owner }}"
+    group: "{{ natssl_file_group }}"
+    mode: '0600'
+  diff: false
+  no_log: true
   notify: restart natssl-client
 
 - name: Install client systemd unit
   ansible.builtin.template:
     src: natssl-client.service.j2
     dest: /etc/systemd/system/natssl-client.service
-    mode: "0644"
+    mode: '0644'
   notify:
     - reload systemd
     - restart natssl-client
+  when: natssl_manage_services | bool
 
-- name: Enable & start client (installs CA, enrolls, pulls)
+- name: Enable client and restart after a binary upgrade
   ansible.builtin.systemd:
     name: natssl-client
     enabled: true
-    state: started
+    state: "{{ 'restarted' if natssl_binary_changed | default(false) else 'started' }}"
     daemon_reload: true
+  when: natssl_manage_services | bool
 
+- name: Apply client configuration before checking readiness
+  ansible.builtin.meta: flush_handlers
+  when: natssl_manage_services | bool
+
+- name: Wait for enrollment identity and initial signed cache
+  ansible.builtin.stat:
+    path: "{{ natssl_data_dir }}/{{ item }}"
+  loop: [client-identity.crt, network-cache.enc]
+  register: natssl_client_state
+  until: natssl_client_state.stat.exists and natssl_client_state.stat.size | default(0) > 0
+  retries: 15
+  delay: 2
+  when: natssl_manage_services | bool
+
+- name: Verify enrolled identity against the pinned CA
+  ansible.builtin.command:
+    argv: [openssl, verify, -purpose, sslclient, -CAfile, "{{ natssl_data_dir }}/root-ca.crt", "{{ natssl_data_dir }}/client-identity.crt"]
+  changed_when: false
+  when: natssl_manage_services | bool

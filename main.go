@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	Version   = "1.0.9"
+	Version   = "1.0.10"
 	Commit    = "nogit"
 	BuildDate = "20062026"
 )
@@ -77,6 +77,12 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("[natssl] ")
 
+	if clientOnly && ((*mode != "" && *mode != "client") || *bootstrap || *promote ||
+		*reissue != "" || *revoke != "" || *listCerts || *listRevoked || *listClients ||
+		*listBlocked || *deregister != "" || *block != "" || *unblock != "") {
+		log.Fatal("client-only build: master operations and promotion are disabled")
+	}
+
 	if *showVer {
 		fmt.Printf("NATSSL %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 		return
@@ -89,6 +95,9 @@ func main() {
 	if cfg == nil {
 		cfg = DefaultConfig()
 		cfg.path = *configPath
+	}
+	if clientOnly && cfg.Mode != "client" {
+		log.Fatal("client-only build: config mode must be client")
 	}
 
 	if *mode == "" {

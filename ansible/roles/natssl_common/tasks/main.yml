@@ -1,50 +1,82 @@
 ---
-- name: Map Ansible arch -> Go arch
+- name: Validate supported native deployment platform
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.system == 'Linux'
+      - ansible_facts.os_family in ['Debian', 'RedHat']
+      - ansible_facts.architecture in ['x86_64', 'amd64', 'aarch64', 'arm64']
+    fail_msg: Native Ansible deployment supports Debian/RedHat Linux on amd64/arm64.
+
+- name: Map architecture
   ansible.builtin.set_fact:
-    natssl_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_architecture] }}"
+    natssl_arch: "{{ {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}[ansible_facts.architecture] }}"
+    natssl_binary_changed: false
 
-- name: Ensure config dir
+- name: Ensure config and state directories
   ansible.builtin.file:
-    path: "{{ natssl_conf_dir }}"
+    path: "{{ item.path }}"
     state: directory
-    mode: "0750"
+    mode: "{{ item.mode }}"
+    owner: "{{ natssl_file_owner }}"
+    group: "{{ natssl_file_group }}"
+  loop:
+    - {path: "{{ natssl_conf_dir }}", mode: '0750'}
+    - {path: "{{ natssl_data_dir }}", mode: '0700'}
 
-- name: Ensure data dir (CA keys + sqlite)
-  ansible.builtin.file:
-    path: "{{ natssl_data_dir }}"
-    state: directory
-    mode: "0700"
-
-- name: Install certutil (Firefox/NSS integration)
+- name: Install native trust-store and recovery prerequisites
   ansible.builtin.package:
-    name: "{{ 'libnss3-tools' if ansible_os_family == 'Debian' else 'nss-tools' }}"
+    name: "{{ ['ca-certificates', 'openssl', 'tar'] + (['libnss3-tools', 'iputils-ping'] if ansible_facts.os_family == 'Debian' else ['nss-tools', 'iputils']) }}"
     state: present
 
+  when: natssl_manage_packages | bool
+
 - name: Check installed natssl version
-  ansible.builtin.command: "{{ natssl_bin }} --version"
+  ansible.builtin.command:
+    argv: ["{{ natssl_bin }}", --version]
   register: natssl_have
   changed_when: false
   failed_when: false
+  check_mode: false
 
-- name: Download + install natssl {{ natssl_pkg_version }}
-  when: natssl_pkg_version not in (natssl_have.stdout | default(''))
+- name: Install verified native release
+  when: natssl_install_binary | bool and ('NATSSL ' ~ natssl_pkg_version ~ ' ') not in (natssl_have.stdout | default(''))
   block:
-    - name: Download release tarball
+    - name: Create private temporary installation directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: natssl-install-
+      register: natssl_install_tmp
+
+    - name: Download release with SHA-256 verification
       ansible.builtin.get_url:
         url: "{{ natssl_download_base }}/{{ natssl_release_tag }}/natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}.tar.gz"
-        dest: "/tmp/natssl-{{ natssl_pkg_version }}-{{ natssl_arch }}.tar.gz"
-        mode: "0644"
+        dest: "{{ natssl_install_tmp.path }}/natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}.tar.gz"
+        checksum: "sha256:{{ natssl_download_base }}/{{ natssl_release_tag }}/SHA256SUMS.txt"
+        validate_certs: true
+        mode: '0600'
 
-    - name: Unpack
+    - name: Unpack verified binary
       ansible.builtin.unarchive:
-        src: "/tmp/natssl-{{ natssl_pkg_version }}-{{ natssl_arch }}.tar.gz"
-        dest: /tmp/
+        src: "{{ natssl_install_tmp.path }}/natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}.tar.gz"
+        dest: "{{ natssl_install_tmp.path }}/"
         remote_src: true
 
-    - name: Install binary to {{ natssl_bin }}
+    - name: Install native binary
       ansible.builtin.copy:
-        src: "/tmp/natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}"
+        src: "{{ natssl_install_tmp.path }}/natssl-{{ natssl_pkg_version }}-linux-{{ natssl_arch }}"
         dest: "{{ natssl_bin }}"
         remote_src: true
-        mode: "0755"
+        owner: "{{ natssl_file_owner }}"
+        group: "{{ natssl_file_group }}"
+        mode: '0755'
+      register: natssl_install_result
 
+    - name: Record binary upgrade for service restart
+      ansible.builtin.set_fact:
+        natssl_binary_changed: "{{ natssl_install_result.changed }}"
+  always:
+    - name: Remove temporary installer files
+      ansible.builtin.file:
+        path: "{{ natssl_install_tmp.path }}"
+        state: absent
+      when: natssl_install_tmp.path is defined

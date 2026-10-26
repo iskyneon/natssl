@@ -124,8 +124,8 @@ ansible natssl_master -b -m shell -a "openssl x509 -in /var/lib/natssl/root-ca.c
 ansible natssl_master -b -m shell -a "openssl crl  -in /var/lib/natssl/root-ca.crl -noout -text | head -n 20"
 ```
 
-> Revoke / reissue / block / unblock / deregister **propagate the cache + CRL to
-> clients immediately** (no need to wait for the master's ticker).
+> Administrative changes publish a new signed snapshot immediately. Clients
+> receive it on their next `pull_interval` over mTLS; cache/CRL push is disabled.
 
 Service status:
 ```bash
@@ -140,7 +140,8 @@ ansible natssl_clients -b -m command -a "systemctl status natssl-client --no-pag
 <details>
 <summary>Client: empty master_fingerprint</summary>
 
-The fact is gathered only in the master play. Run the full playbook.
+The fact is read from the native master after bootstrap. Run the full playbook;
+client config receives both the Root CA pin and recovery public key.
 </details>
 
 <details>
@@ -156,3 +157,49 @@ Dot-less names are rejected. Use IP (default) or an FQDN with
 Idempotent via `creates:`. Use `-e natssl_reissue=true` to revoke + reissue.
 </details>
 
+
+## Version and protocol compatibility
+
+The default native release is **1.0.10** (`natssl_release_tag`); its package
+version is derived automatically. Downloads are verified against the release's
+`SHA256SUMS.txt` before extraction. Installing a changed binary restarts the
+corresponding service. Native master/client binaries support both roles; the
+GHCR image is client-only and is not used by these native systemd roles.
+
+`group_vars/vault.yml` is explicitly loaded by the master/client plays. Put the
+same `natssl_enrollment_token` there and encrypt it with `ansible-vault encrypt`.
+Initial bootstrap displays the recovery phrase once: record it offline and
+protect playbook output. Never replace an existing CA to upgrade binaries.
+
+The client template includes both API addresses, custom ports, `pull_interval`,
+`ping_interval`, the migration listener and `install_trust`. The master template
+includes `server_names`; add any DNS aliases used by clients to
+`natssl_server_names`. Existing recovery public keys and client migration replay
+protection are preserved using YAML parsing. Signed migration requires a writable
+config directory, which the client systemd unit permits.
+
+Per-client issuance uses the native master over the administrative CLI. Delegated
+paths come from that master's host variables; certificate names are canonicalized
+exactly as the Go CLI (including compressed IPv6 and lowercase DNS names).
+Private keys are delivered with mode 0600 and are suppressed from Ansible logs.
+Specifying `hostname` for a dot-less inventory name fails with an explanation.
+
+## Validation
+
+```bash
+pip install -r ../tests/requirements-ansible.txt
+ansible-playbook playbook-install-natssl.yml --syntax-check
+```
+
+CI runs `tests/test_ansible.py` against the **real roles and native binary** in
+private local directories. It checks checksum rejection, repeat deployment,
+preserved CA/policy, real mTLS enrollment/pull from rendered configs, delegated
+IPv6/DNS issuance, idempotent delivery and rotation. System packages/systemd
+management are disabled for these isolated tests; no host trust stores change.
+Deployment still requires supported Debian/RedHat Linux hosts and systemd.
+
+For externally managed services/tests use `natssl_manage_services: false`;
+`natssl_manage_packages` and `natssl_install_binary` can independently disable
+those provisioning steps. Native file ownership defaults to root and is
+configurable with `natssl_file_owner`/`natssl_file_group`. The normal deployment
+keeps all provisioning enabled and checks HTTPS readiness plus client enrollment.

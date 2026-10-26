@@ -1,74 +1,111 @@
 ---
-# Сохраняем recovery_public_key, если bootstrap уже был (чтобы шаблон его не затёр)
-- name: Check if master config already exists
+- name: Validate enrollment policy
+  ansible.builtin.assert:
+    that:
+      - natssl_enrollment_token is defined
+      - natssl_enrollment_token | length > 0
+      - natssl_enrollment_token not in ['REPLACE_ME', 'CHANGE_ME']
+    fail_msg: Configure natssl_enrollment_token securely in group_vars/vault.yml.
+  no_log: true
+
+- name: Check existing master config
   ansible.builtin.stat:
     path: "{{ natssl_conf_file }}"
   register: master_cfg_stat
 
-- name: Pre-read existing recovery_public_key (preserve across re-runs)
+- name: Read existing master config
   ansible.builtin.slurp:
     src: "{{ natssl_conf_file }}"
   register: master_cfg_pre
   when: master_cfg_stat.stat.exists
+  no_log: true
 
-- name: Set recovery_public_key fact (empty on first run)
+- name: Preserve recovery public key
   ansible.builtin.set_fact:
-    natssl_recovery_public_key: >-
-      {{ (master_cfg_pre.content | b64decode
-          | regex_search('recovery_public_key:\s*"?([^"\n]*)', '\1') | first)
-         if master_cfg_stat.stat.exists else '' }}
+    natssl_recovery_public_key: "{{ (master_cfg_pre.content | b64decode | from_yaml).recovery_public_key | default('') if master_cfg_stat.stat.exists else '' }}"
+  no_log: true
 
-- name: Render master config.yaml
+- name: Render master config
   ansible.builtin.template:
     src: config.master.yaml.j2
     dest: "{{ natssl_conf_file }}"
-    owner: root
-    group: root
-    mode: "0600"
+    owner: "{{ natssl_file_owner }}"
+    group: "{{ natssl_file_group }}"
+    mode: '0600'
+  diff: false
+  no_log: true
   notify: restart natssl-master
 
 - name: Install master systemd unit
   ansible.builtin.template:
     src: natssl-master.service.j2
     dest: /etc/systemd/system/natssl-master.service
-    mode: "0644"
+    mode: '0644'
   notify:
     - reload systemd
     - restart natssl-master
+  when: natssl_manage_services | bool
 
-# --- Bootstrap: ОДИН раз. creates: гарантирует идемпотентность ---
-- name: Bootstrap Root CA (prints 24-word seed + fingerprint ONCE)
+- name: Bootstrap Root CA once
   ansible.builtin.command:
-    cmd: "{{ natssl_bin }} --mode=master --bootstrap --config={{ natssl_conf_file }}"
+    argv: ["{{ natssl_bin }}", --mode=master, --bootstrap, "--config={{ natssl_conf_file }}"]
     creates: "{{ natssl_data_dir }}/root-ca.crt"
   register: natssl_bootstrap
+  no_log: true
 
-- name: ">>> RECORD THIS 24-WORD SEED OFFLINE NOW (shown only once) <<<"
+- name: Record the recovery phrase offline; protect the playbook output
   ansible.builtin.debug:
     msg: "{{ natssl_bootstrap.stdout_lines }}"
-  when: natssl_bootstrap is changed
+  when: natssl_bootstrap is changed and natssl_show_recovery_seed | bool
 
-- name: Enable & start master
-  ansible.builtin.systemd:
-    name: natssl-master
-    enabled: true
-    state: started
-    daemon_reload: true
-
-# --- Экспорт значений для клиентов ---
-- name: Read Root CA SHA-256 fingerprint
-  ansible.builtin.command: >-
-    openssl x509 -in {{ natssl_data_dir }}/root-ca.crt -noout -fingerprint -sha256
+- name: Read Root CA fingerprint
+  ansible.builtin.command:
+    argv: [openssl, x509, -in, "{{ natssl_data_dir }}/root-ca.crt", -noout, -fingerprint, -sha256]
   register: rootca_fp
   changed_when: false
 
-- name: Re-read recovery_public_key (now filled by bootstrap)
+- name: Read bootstrapped master config
   ansible.builtin.slurp:
     src: "{{ natssl_conf_file }}"
   register: master_cfg_post
+  no_log: true
 
-- name: Publish master facts (consumed by clients via hostvars)
+- name: Publish pin and recovery public key for clients
   ansible.builtin.set_fact:
     natssl_master_fingerprint: "{{ rootca_fp.stdout.split('=')[1] | trim }}"
-    natssl_recovery_public_key: "{{ master_cfg_post.content | b64decode
-        | regex_search('recovery_public_key:\\s*\"?([^\"\\n]*)', '\\1') | first }}"
+    natssl_recovery_public_key: "{{ (master_cfg_post.content | b64decode | from_yaml).recovery_public_key }}"
+  no_log: true
+
+- name: Normalize bootstrapped config to the deployment template
+  ansible.builtin.template:
+    src: config.master.yaml.j2
+    dest: "{{ natssl_conf_file }}"
+    owner: "{{ natssl_file_owner }}"
+    group: "{{ natssl_file_group }}"
+    mode: '0600'
+  diff: false
+  no_log: true
+
+- name: Enable master and restart after a binary upgrade
+  ansible.builtin.systemd:
+    name: natssl-master
+    enabled: true
+    state: "{{ 'restarted' if natssl_binary_changed | default(false) else 'started' }}"
+    daemon_reload: true
+  when: natssl_manage_services | bool
+
+- name: Apply configuration and unit changes before checking readiness
+  ansible.builtin.meta: flush_handlers
+  when: natssl_manage_services | bool
+
+- name: Verify master HTTPS readiness using its Root CA
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ natssl_acme_listen.rsplit(':', 1)[-1] }}/health"
+    ca_path: "{{ natssl_data_dir }}/root-ca.crt"
+    validate_certs: true
+    return_content: true
+  register: natssl_master_health
+  until: natssl_master_health.status | default(0) == 200 and natssl_master_health.content | default('') == 'ok'
+  retries: 10
+  delay: 2
+  when: natssl_manage_services | bool

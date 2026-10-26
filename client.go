@@ -68,6 +68,9 @@ func RunClient(cfg *Config) error {
 	// Retry failed trust-store installation on subsequent registration ticks.
 	installOS, installFirefox := true, true
 	installTrust := func() {
+		if !cfg.InstallTrust {
+			return
+		}
 		data, err := os.ReadFile(cfg.caCertPath())
 		if err != nil {
 			return

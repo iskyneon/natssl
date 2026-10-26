@@ -52,8 +52,8 @@ revoked identity certificates remain revoked.
 
 ```bash
 ARCH=$(uname -m); case "$ARCH" in x86_64) A=amd64;; aarch64|arm64) A=arm64;; esac
-tar -xzf natssl-1.0.9-oss-linux-$A.tar.gz
-sudo install -m0755 natssl-1.0.9-oss-linux-$A /usr/local/bin/natssl
+tar -xzf natssl-1.0.10-oss-linux-$A.tar.gz
+sudo install -m0755 natssl-1.0.10-oss-linux-$A /usr/local/bin/natssl
 sudo mkdir -p /etc/natssl /var/lib/natssl
 sudo apt-get install -y libnss3-tools ca-certificates iputils-ping   # Debian/Ubuntu
 sudo dnf install -y nss-tools iputils                            # RHEL/Rocky
@@ -249,3 +249,15 @@ TLS endpoints and exercise enrollment, issuance, revocation, replication,
 rollback protection and recovery state. They do not install OS trust anchors or
 change Firefox profiles. OS/Firefox integration and service-manager deployment
 need validation on the target distribution.
+
+## 13. Container and Ansible roles
+
+The GHCR image is client-only (including its default mode); master, bootstrap,
+administrative commands and promotion are disabled in its compiled binary.
+Use the native master with either container or native clients. Containers retain
+state in a bind mount and do not automatically install trust on the host. See
+[docker deployment](../docker/README.md).
+
+The Ansible roles deploy the full native release, verify release SHA-256, preserve
+bootstrap/replay state, restart upgraded services and render the current mTLS
+configuration. See [Ansible](../ansible/README.md) for variables and tested paths.

@@ -29,3 +29,22 @@ jobs:
           GOOS=linux GOARCH=amd64 go build ./...
           GOOS=linux GOARCH=arm64 go build ./...
 
+
+  ansible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install -r tests/requirements-ansible.txt
+      - name: Check Ansible syntax
+        working-directory: ansible
+        run: ansible-playbook playbook-install-natssl.yml --syntax-check
+      - name: Build native binary for deployment tests
+        run: make build BINARY=/tmp/natssl-ansible
+      - name: Exercise real deployment roles and protocol
+        env:
+          NATSSL_TEST_BINARY: /tmp/natssl-ansible
+        run: python tests/test_ansible.py

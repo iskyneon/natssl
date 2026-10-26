@@ -60,6 +60,9 @@ func RebuildEncryptedCache(cfg *Config, ca *CA, st *Store) error {
 // RunBootstrap initializes a brand-new Root CA (valid 10 years) and prints the
 // 24-word recovery seed exactly once.
 func RunBootstrap(cfg *Config) error {
+	if clientOnly {
+		return fmt.Errorf("client-only build: bootstrap is disabled")
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
@@ -380,6 +383,9 @@ func newHTTPServer(addr string, handler http.Handler, tlsCfg *tls.Config) *http.
 }
 
 func RunMaster(cfg *Config) error {
+	if clientOnly {
+		return fmt.Errorf("client-only build: master mode is disabled")
+	}
 	if len(cfg.ClientNetworks) > 0 && (cfg.EnrollmentToken == "" || cfg.EnrollmentToken == "REPLACE_ME") {
 		return fmt.Errorf("enrollment_token is required when client_networks is set")
 	}
