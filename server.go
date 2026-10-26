@@ -7,16 +7,21 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 )
 
-// RebuildEncryptedCache builds a snapshot, encrypts it with AES-GCM, and seals
-// the symmetric key with the recovery public key.
 func RebuildEncryptedCache(cfg *Config, ca *CA, st *Store) error {
+	unlock, err := lockFile(cfg.cachePath() + ".lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	pub, err := RecoveryPublicFromBase64(cfg.RecoveryPublicKey)
 	if err != nil {
 		return err
@@ -25,6 +30,18 @@ func RebuildEncryptedCache(cfg *Config, ca *CA, st *Store) error {
 	if err != nil {
 		return err
 	}
+	if previous, err := ReadEncryptedCache(cfg.cachePath()); err == nil && previous.Verify(ca.Cert) == nil {
+		if _, err := st.db.Exec(`UPDATE state SET value=MAX(value,?) WHERE key='cache_sequence'`, previous.Sequence); err != nil {
+			return err
+		}
+	}
+	seq, err := st.nextCacheSequence()
+	if err != nil {
+		return err
+	}
+	snap.Sequence = seq
+	snap.EnrollmentToken = cfg.EnrollmentToken
+	snap.ClientNetworks = cfg.ClientNetworks
 	raw, err := json.Marshal(snap)
 	if err != nil {
 		return err
@@ -33,16 +50,33 @@ func RebuildEncryptedCache(cfg *Config, ca *CA, st *Store) error {
 	if err != nil {
 		return err
 	}
+	ec.Sequence = seq
+	if err := ec.Sign(ca); err != nil {
+		return err
+	}
 	return ec.WriteFile(cfg.cachePath())
 }
 
 // RunBootstrap initializes a brand-new Root CA (valid 10 years) and prints the
 // 24-word recovery seed exactly once.
 func RunBootstrap(cfg *Config) error {
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return err
+	}
+	unlock, err := lockFile(cfg.caKeyPath() + ".bootstrap.lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if _, err := os.Stat(cfg.caKeyPath()); err == nil {
+		return fmt.Errorf("Root CA key already exists — refusing to overwrite")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if _, err := os.Stat(cfg.caCertPath()); err == nil {
 		return fmt.Errorf("Root CA already exists at %s — refusing to overwrite", cfg.caCertPath())
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
 
@@ -72,11 +106,10 @@ func RunBootstrap(cfg *Config) error {
 	for _, c := range cfg.Clients {
 		st.AddClient(c)
 	}
-	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
+	if err := WriteCRL(cfg, ca, st); err != nil {
 		return err
 	}
-	// Emit an initial (empty) CRL so /crl never 404s.
-	if err := WriteCRL(cfg, ca, st); err != nil {
+	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
 		return err
 	}
 
@@ -95,6 +128,12 @@ func RunBootstrap(cfg *Config) error {
 
 // enforceLoopbackOnly is the HARD authorization rule for client-submitted CSRs.
 func enforceLoopbackOnly(csr *x509.CertificateRequest, localhost bool) error {
+	if csr.Subject.CommonName != "" && !isLoopbackTarget(csr.Subject.CommonName) {
+		return fmt.Errorf("only loopback common names are allowed")
+	}
+	if len(csr.EmailAddresses) > 0 || len(csr.URIs) > 0 {
+		return fmt.Errorf("only loopback DNS/IP SANs are allowed")
+	}
 	if !localhost {
 		return fmt.Errorf("clients may only request localhost certificates " +
 			"(use --localhost); domain/IP issuance is reserved for the administrator on the master")
@@ -115,17 +154,235 @@ func enforceLoopbackOnly(csr *x509.CertificateRequest, localhost bool) error {
 	return nil
 }
 
-// checkEnrollment validates the shared enrollment token (constant-time).
 func checkEnrollment(cfg *Config, r *http.Request) bool {
-	if cfg.EnrollmentToken == "" {
-		return true
-	}
-	got := r.Header.Get("X-Enrollment-Token")
-	return subtle.ConstantTimeCompare([]byte(got), []byte(cfg.EnrollmentToken)) == 1
+	return cfg.EnrollmentToken != "REPLACE_ME" && cfg.EnrollmentToken != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Enrollment-Token")), []byte(cfg.EnrollmentToken)) == 1
 }
 
-// RunMaster starts the master: ACME API on :443 and mTLS management on :8443.
+func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method != method {
+		w.Header().Set("Allow", method)
+		http.Error(w, "method not allowed", 405)
+		return false
+	}
+	return true
+}
+
+func decodeRequest(w http.ResponseWriter, r *http.Request, out any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	dec := json.NewDecoder(r.Body)
+	err := dec.Decode(out)
+	if err == nil {
+		var extra any
+		if e := dec.Decode(&extra); e != io.EOF {
+			err = fmt.Errorf("expected a single JSON object")
+		}
+	}
+	if err != nil {
+		status := http.StatusBadRequest
+		if _, ok := err.(*http.MaxBytesError); ok {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
+		return false
+	}
+	return true
+}
+
+func certRecord(cert *x509.Certificate, certPEM string) CertRecord {
+	serial := cert.SerialNumber.Text(16)
+	return CertRecord{ID: serial, SerialHex: serial, Subject: cert.Subject.CommonName, SANs: strings.Join(append(cert.DNSNames, ipsToStr(cert.IPAddresses)...), ","), NotBefore: cert.NotBefore, NotAfter: cert.NotAfter, CertPEM: certPEM}
+}
+
+// Separate routers prevent public issuance or unauthenticated snapshot access.
+func masterHandlers(cfg *Config, ca *CA, st *Store) (http.Handler, http.Handler) {
+	bootstrap, control := http.NewServeMux(), http.NewServeMux()
+	bootstrap.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if requireMethod(w, r, "GET") {
+			io.WriteString(w, "ok")
+		}
+	})
+	bootstrap.HandleFunc("/ca", func(w http.ResponseWriter, r *http.Request) {
+		if requireMethod(w, r, "GET") {
+			w.Header().Set("Content-Type", "application/x-pem-file")
+			w.Write(ca.certPEMBytes())
+		}
+	})
+	bootstrap.HandleFunc("/acme/register", func(w http.ResponseWriter, r *http.Request) {
+		if !requireMethod(w, r, "POST") {
+			return
+		}
+		ip := host(r.RemoteAddr)
+		blocked, err := st.IsBlocked(ip)
+		if err != nil {
+			http.Error(w, "database unavailable", 500)
+			return
+		}
+		if blocked || !checkEnrollment(cfg, r) || !cfg.ClientAllowed(ip) {
+			log.Printf("AUDIT enrollment denied ip=%s", ip)
+			http.Error(w, "enrollment denied: token, network or blacklist", 403)
+			return
+		}
+		var req struct {
+			CSR string `json:"csr"`
+		}
+		if !decodeRequest(w, r, &req) {
+			return
+		}
+		var certPEM string
+		if req.CSR != "" {
+			b, _ := pem.Decode([]byte(req.CSR))
+			if b == nil || b.Type != "CERTIFICATE REQUEST" {
+				http.Error(w, "bad CSR PEM", 400)
+				return
+			}
+			csr, err := x509.ParseCertificateRequest(b.Bytes)
+			if err != nil || csr.CheckSignature() != nil {
+				http.Error(w, "invalid CSR", 400)
+				return
+			}
+			certPEM, err = ca.IssueClientCert(csr, identityPrefix+ip)
+			if err != nil {
+				http.Error(w, "cannot issue client identity", 500)
+				return
+			}
+			b, _ = pem.Decode([]byte(certPEM))
+			cert, err := x509.ParseCertificate(b.Bytes)
+			if err != nil {
+				http.Error(w, "invalid identity", 500)
+				return
+			}
+			if err := st.AddCert(certRecord(cert, certPEM)); err != nil {
+				http.Error(w, "cannot save identity", 500)
+				return
+			}
+		}
+		if _, err := st.registerClient(ip); err != nil {
+			http.Error(w, "cannot register client", 500)
+			return
+		}
+		if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
+			http.Error(w, "cannot rebuild cache", 500)
+			return
+		}
+		log.Printf("AUDIT client %s enrolled", ip)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "ip": ip, "certificate": certPEM})
+	})
+	control.HandleFunc("/sync/health", func(w http.ResponseWriter, r *http.Request) {
+		if requireMethod(w, r, "GET") {
+			io.WriteString(w, "ok")
+		}
+	})
+	control.HandleFunc("/sync/cache", func(w http.ResponseWriter, r *http.Request) {
+		if requireMethod(w, r, "GET") {
+			w.Header().Set("Content-Type", "application/json")
+			http.ServeFile(w, r, cfg.cachePath())
+		}
+	})
+	control.HandleFunc("/sync/crl", func(w http.ResponseWriter, r *http.Request) {
+		if requireMethod(w, r, "GET") {
+			if err := refreshCRL(cfg, ca, st); err != nil {
+				http.Error(w, "cannot refresh CRL", 500)
+				return
+			}
+			w.Header().Set("Content-Type", "application/pkix-crl")
+			http.ServeFile(w, r, cfg.crlPath())
+		}
+	})
+	control.HandleFunc("/acme/sign-csr", func(w http.ResponseWriter, r *http.Request) {
+		if !requireMethod(w, r, "POST") {
+			return
+		}
+		var req struct {
+			CSR       string `json:"csr"`
+			Localhost bool   `json:"localhost"`
+		}
+		if !decodeRequest(w, r, &req) {
+			return
+		}
+		b, _ := pem.Decode([]byte(req.CSR))
+		if b == nil || b.Type != "CERTIFICATE REQUEST" {
+			http.Error(w, "bad CSR PEM", 400)
+			return
+		}
+		csr, err := x509.ParseCertificateRequest(b.Bytes)
+		if err != nil || csr.CheckSignature() != nil {
+			http.Error(w, "invalid CSR", 400)
+			return
+		}
+		if err := enforceLoopbackOnly(csr, req.Localhost); err != nil {
+			log.Printf("AUDIT CSR denied ip=%s", host(r.RemoteAddr))
+			http.Error(w, err.Error(), 403)
+			return
+		}
+		res, err := ca.SignCSR(csr, true)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := st.AddCert(certRecord(res.Cert, res.CertPEM)); err != nil {
+			http.Error(w, "cannot save certificate", 500)
+			return
+		}
+		if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
+			http.Error(w, "cannot rebuild cache", 500)
+			return
+		}
+		log.Printf("AUDIT signed loopback CSR ip=%s serial=%s", host(r.RemoteAddr), res.Cert.SerialNumber.Text(16))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"certificate": res.CertPEM})
+	})
+	return bootstrap, authorizeClient(st, control)
+}
+
+func authorizeClient(st *Store, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates) == 0 {
+			http.Error(w, "client identity required", 403)
+			return
+		}
+		cert := r.TLS.PeerCertificates[0]
+		ip := strings.TrimPrefix(cert.Subject.CommonName, identityPrefix)
+		if ip == cert.Subject.CommonName || net.ParseIP(ip) == nil {
+			http.Error(w, "enrollment identity required", 403)
+			return
+		}
+		blocked, err := st.IsBlocked(ip)
+		if err != nil {
+			http.Error(w, "database unavailable", 500)
+			return
+		}
+		revoked, err := st.IsRevoked(cert.SerialNumber.Text(16))
+		if err != nil {
+			http.Error(w, "database unavailable", 500)
+			return
+		}
+		rec, found, err := st.CertBySerial(cert.SerialNumber.Text(16))
+		if err != nil {
+			http.Error(w, "database unavailable", 500)
+			return
+		}
+		registered, err := st.hasClient(ip)
+		if err != nil {
+			http.Error(w, "database unavailable", 500)
+			return
+		}
+		if blocked || revoked || !registered || !found || rec.Subject != cert.Subject.CommonName || rec.CertPEM != string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})) {
+			http.Error(w, "client is blocked, revoked or not registered", 403)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func newHTTPServer(addr string, handler http.Handler, tlsCfg *tls.Config) *http.Server {
+	return &http.Server{Addr: addr, Handler: handler, TLSConfig: tlsCfg, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+}
+
 func RunMaster(cfg *Config) error {
+	if len(cfg.ClientNetworks) > 0 && (cfg.EnrollmentToken == "" || cfg.EnrollmentToken == "REPLACE_ME") {
+		return fmt.Errorf("enrollment_token is required when client_networks is set")
+	}
 	ca, err := LoadCA(cfg.caCertPath(), cfg.caKeyPath())
 	if err != nil {
 		return fmt.Errorf("no Root CA (run --bootstrap): %w", err)
@@ -135,222 +392,47 @@ func RunMaster(cfg *Config) error {
 		return err
 	}
 	defer st.Close()
-
-	for _, c := range cfg.Clients {
-		st.AddClient(c)
-	}
-
-	// Regenerate the CRL from the current revoked table on startup.
 	if err := WriteCRL(cfg, ca, st); err != nil {
-		log.Printf("WARNING: could not write CRL: %v", err)
+		return err
 	}
-
-	log.Printf("master online | fingerprint %s", ca.Fingerprint())
-	if len(cfg.ClientNetworks) > 0 {
-		log.Printf("auto-registration enabled for networks: %s", strings.Join(cfg.ClientNetworks, ", "))
-	} else {
-		log.Printf("WARNING: client_networks is empty — clients cannot self-register")
+	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
+		return err
 	}
-	if cfg.EnrollmentToken == "" {
-		log.Printf("WARNING: enrollment_token not set — registration relies on source IP only (spoofable on flat L2)")
-	} else {
-		log.Printf("enrollment token required for registration (anti-spoofing enabled)")
+	hosts := append([]string{"localhost", host(cfg.Listen.ACME), host(cfg.Listen.Mgmt)}, cfg.ServerNames...)
+	if name, err := os.Hostname(); err == nil {
+		hosts = append(hosts, name)
 	}
-
-	// Port 443 — ACME-compatible issuance API.
-	acmeMux := http.NewServeMux()
-	acmeMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
-	acmeMux.HandleFunc("/ca", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, cfg.caCertPath())
-	})
-	acmeMux.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, cfg.cachePath())
-	})
-	// Certificate Revocation List (public, signed).
-	acmeMux.HandleFunc("/crl", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, cfg.crlPath())
-	})
-
-	// Client self-registration: NOT blacklisted AND token AND CIDR.
-	acmeMux.HandleFunc("/acme/register", func(w http.ResponseWriter, r *http.Request) {
-		ip := host(r.RemoteAddr)
-
-		if blocked, _ := st.IsBlocked(ip); blocked {
-			log.Printf("DENIED registration from %s (blacklisted)", ip)
-			http.Error(w, "this client is blacklisted", 403)
-			return
-		}
-		if !checkEnrollment(cfg, r) {
-			log.Printf("DENIED registration from %s (invalid/missing enrollment token)", ip)
-			http.Error(w, "invalid or missing enrollment token", 403)
-			return
-		}
-		if !cfg.ClientAllowed(ip) {
-			log.Printf("DENIED registration from %s (not in client_networks)", ip)
-			http.Error(w, "your IP is not in any allowed client network", 403)
-			return
-		}
-		newly := st.AddClient(ip)
-		if newly {
-			log.Printf("client registered: %s", ip)
-		}
-		json.NewEncoder(w).Encode(map[string]any{"status": "ok", "ip": ip, "new": newly})
-	})
-
-	// Issuance where the master generates the key (admin-style; returns key).
-	acmeMux.HandleFunc("/acme/new-order", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Subject   string   `json:"subject"`
-			SANs      []string `json:"sans"`
-			ClientPub string   `json:"client_pub"`
-			Localhost bool     `json:"localhost"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		res, err := ca.Issue(req.Subject, req.SANs, req.Localhost)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		rec := CertRecord{
-			ID: res.Cert.SerialNumber.Text(16), Subject: req.Subject,
-			SANs: strings.Join(req.SANs, ","), NotBefore: res.Cert.NotBefore,
-			NotAfter: res.Cert.NotAfter, ClientPub: req.ClientPub,
-			SerialHex: res.Cert.SerialNumber.Text(16), CertPEM: res.CertPEM,
-		}
-		st.AddCert(rec)
-		RebuildEncryptedCache(cfg, ca, st)
-		json.NewEncoder(w).Encode(map[string]string{
-			"certificate": res.CertPEM, "private_key": res.KeyPEM,
-		})
-	})
-
-	// CSR signing for clients. HARD RULE: clients get loopback-only certs.
-	acmeMux.HandleFunc("/acme/sign-csr", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			CSR       string `json:"csr"`
-			ClientPub string `json:"client_pub"`
-			Localhost bool   `json:"localhost"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		block, _ := pem.Decode([]byte(req.CSR))
-		if block == nil {
-			http.Error(w, "bad CSR PEM", 400)
-			return
-		}
-		csr, err := x509.ParseCertificateRequest(block.Bytes)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		if err := enforceLoopbackOnly(csr, req.Localhost); err != nil {
-			log.Printf("DENIED CSR from %s: %v", r.RemoteAddr, err)
-			http.Error(w, err.Error(), 403)
-			return
-		}
-
-		res, err := ca.SignCSR(csr, req.Localhost)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		subject := csr.Subject.CommonName
-		rec := CertRecord{
-			ID: res.Cert.SerialNumber.Text(16), Subject: subject,
-			SANs:      strings.Join(append(res.Cert.DNSNames, ipsToStr(res.Cert.IPAddresses)...), ","),
-			NotBefore: res.Cert.NotBefore, NotAfter: res.Cert.NotAfter,
-			ClientPub: req.ClientPub, SerialHex: res.Cert.SerialNumber.Text(16),
-			CertPEM: res.CertPEM,
-		}
-		st.AddCert(rec)
-		RebuildEncryptedCache(cfg, ca, st)
-		log.Printf("signed loopback CSR for %q (serial %s)", subject, rec.SerialHex)
-		json.NewEncoder(w).Encode(map[string]string{"certificate": res.CertPEM})
-	})
-
-	// Periodic cache + CRL fan-out to all registered clients.
-	go func() {
-		t := time.NewTicker(cfg.PullInterval)
-		defer t.Stop()
-		for range t.C {
-			pushCacheToClients(cfg, st)
-			pushCRLToClients(cfg, st)
-		}
-	}()
-
-	go func() {
-		srv := &http.Server{Addr: cfg.Listen.ACME, Handler: acmeMux}
-		log.Printf("ACME API on %s", cfg.Listen.ACME)
-		log.Fatal(srv.ListenAndServeTLS(cfg.caCertPath(), cfg.caKeyPath()))
-	}()
-
-	// Port 8443 — internal management/sync (mTLS).
-	mgmtMux := http.NewServeMux()
-	mgmtMux.HandleFunc("/sync/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
-	mgmtMux.HandleFunc("/sync/clients", func(w http.ResponseWriter, r *http.Request) {
-		cls, _ := st.ListClients()
-		json.NewEncoder(w).Encode(cls)
-	})
-
-	caPool := x509.NewCertPool()
-	caPool.AddCert(ca.Cert)
-	mgmtSrv := &http.Server{
-		Addr:    cfg.Listen.Mgmt,
-		Handler: mgmtMux,
-		TLSConfig: &tls.Config{
-			ClientAuth: tls.RequireAndVerifyClientCert,
-			ClientCAs:  caPool,
-			MinVersion: tls.VersionTLS12,
-		},
+	if ips, err := localIPv4s(); err == nil {
+		hosts = append(hosts, ips...)
 	}
-	log.Printf("mTLS management on %s", cfg.Listen.Mgmt)
-	return mgmtSrv.ListenAndServeTLS(cfg.caCertPath(), cfg.caKeyPath())
-}
-
-func pushCacheToClients(cfg *Config, st *Store) {
-	cls, _ := st.ListClients()
-	data, err := os.ReadFile(cfg.cachePath())
+	chain, key, err := ca.IssueServerCert(hosts)
 	if err != nil {
-		return
+		return err
 	}
-	client := insecureMasterClient()
-	for _, c := range cls {
-		url := fmt.Sprintf("https://%s:8443/cache/push", host(c))
-		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(string(data)))
-		req.Header.Set("Content-Type", "application/octet-stream")
-		if resp, err := client.Do(req); err == nil {
-			resp.Body.Close()
-			log.Printf("cache pushed to %s", c)
-		}
-	}
-}
-
-// pushCRLToClients fans the signed CRL out to every registered client.
-func pushCRLToClients(cfg *Config, st *Store) {
-	cls, _ := st.ListClients()
-	data, err := os.ReadFile(cfg.crlPath())
+	pair, err := tls.X509KeyPair(chain, key)
 	if err != nil {
-		return
+		return err
 	}
-	client := insecureMasterClient()
-	for _, c := range cls {
-		url := fmt.Sprintf("https://%s:8443/crl/push", host(c))
-		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(string(data)))
-		req.Header.Set("Content-Type", "application/pkix-crl")
-		if resp, err := client.Do(req); err == nil {
-			resp.Body.Close()
-			log.Printf("CRL pushed to %s", c)
-		}
+	roots := x509.NewCertPool()
+	roots.AddCert(ca.Cert)
+	public, control := masterHandlers(cfg, ca, st)
+	api := newHTTPServer(cfg.Listen.ACME, public, &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{pair}})
+	mgmt := newHTTPServer(cfg.Listen.Mgmt, control, &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{pair}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: roots})
+	a, err := net.Listen("tcp", api.Addr)
+	if err != nil {
+		return err
 	}
+	defer a.Close()
+	m, err := net.Listen("tcp", mgmt.Addr)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	defer api.Close()
+	defer mgmt.Close()
+	errs := make(chan error, 2)
+	go func() { errs <- api.Serve(tls.NewListener(a, api.TLSConfig)) }()
+	go func() { errs <- mgmt.Serve(tls.NewListener(m, mgmt.TLSConfig)) }()
+	log.Printf("master online | API %s | mTLS %s | fingerprint %s", api.Addr, mgmt.Addr, ca.Fingerprint())
+	return <-errs
 }
-

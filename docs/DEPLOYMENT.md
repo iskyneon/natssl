@@ -5,7 +5,7 @@
 | Role | Count (OSS) | Ports | Notes |
 |---|---|---|---|
 | Master | 1 | 443 (API), 8443 (control) | Root CA signs certs + CRL |
-| Client | N | 8443 (cache/CRL receiver) | Self-enrolls via token + CIDR |
+| Client | N | 8443 (signed migration receiver) | Self-enrolls via token + CIDR |
 
 ---
 
@@ -21,8 +21,11 @@ constant time via `X-Enrollment-Token`.
 <details>
 <summary>2.2 Root CA pinning</summary>
 
-`verifyMasterPin`: (1) fingerprint match if `master_fingerprint` set; else
-(2) chain to local Root CA; else (3) fail closed.
+`verifyMasterPin` checks the dedicated server identity, its hostname and its
+server-auth chain to the exact pinned Root CA. A fingerprint match on an
+unrelated certificate appended to a TLS chain is insufficient. Without a
+fingerprint or local Root CA, bootstrap fails closed. For DNS addresses, add
+the DNS name to the master config under `server_names`.
 </details>
 
 <details>
@@ -37,8 +40,10 @@ constant time via `X-Enrollment-Token`.
 <details>
 <summary>2.4 Blacklist</summary>
 
-`--block <IP>` → `/acme/register` denies that IP (403) regardless of
-token/CIDR. Immediate (same DB). `--unblock` reverses it.
+`--block <IP>` denies enrollment and every control-plane request from identities
+registered for that IP (403), including existing TLS connections. The client is
+removed from the registry. `--unblock` permits registration again. Explicitly
+revoked identity certificates remain revoked.
 </details>
 
 ---
@@ -47,11 +52,11 @@ token/CIDR. Immediate (same DB). `--unblock` reverses it.
 
 ```bash
 ARCH=$(uname -m); case "$ARCH" in x86_64) A=amd64;; aarch64|arm64) A=arm64;; esac
-tar -xzf natssl-1.0.8-oss-linux-$A.tar.gz
-sudo install -m0755 natssl-1.0.8-oss-linux-$A /usr/local/bin/natssl
+tar -xzf natssl-1.0.9-oss-linux-$A.tar.gz
+sudo install -m0755 natssl-1.0.9-oss-linux-$A /usr/local/bin/natssl
 sudo mkdir -p /etc/natssl /var/lib/natssl
-sudo apt-get install -y libnss3-tools ca-certificates   # Debian/Ubuntu
-sudo dnf install -y nss-tools                            # RHEL/Rocky
+sudo apt-get install -y libnss3-tools ca-certificates iputils-ping   # Debian/Ubuntu
+sudo dnf install -y nss-tools iputils                            # RHEL/Rocky
 sudo cp config.<role>.yaml /etc/natssl/config.yaml
 sudo chmod 600 /etc/natssl/config.yaml
 ```
@@ -81,7 +86,8 @@ flowchart TD
     E --> F[start natssl-client]
     F --> G[pin + fetch + install Root CA]
     G --> H[enroll: token + CIDR]
-    H --> I[receive cache + CRL]
+    H --> I[receive mTLS identity]
+    I --> J[pull signed encrypted cache + signed CRL over mTLS]
 ```
 
 ---
@@ -101,8 +107,8 @@ Files: `/var/lib/natssl/issued/<subject>.{crt,key}` (key `0600`); 90 days
 ```bash
 sudo natssl --mode=master --reissue "192.168.1.2"
 ```
-Revokes current cert(s) → CRL → issues fresh → overwrites files → **propagates
-immediately**.
+Revokes current cert(s) → CRL → issues fresh → overwrites files → **publishes
+the updated snapshot immediately; clients receive it on their next pull**.
 
 ### 6.3 Client issuance (loopback only)
 ```bash
@@ -117,8 +123,11 @@ sudo natssl --mode=master --list-revoked
 openssl crl -in /var/lib/natssl/root-ca.crl -noout -text
 ```
 Records the serial, regenerates the **signed X.509 CRL** (`root-ca.crl`),
-rebuilds the cache, and **pushes both to clients now** (also pullable from
-`/crl`). Regenerated on bootstrap and on master start too.
+rebuilds and signs the encrypted cache. Clients pull `/sync/cache` and
+`/sync/crl` over mTLS on port 8443. Changes are published immediately and
+received on the next `pull_interval`; there is no cache/CRL push listener.
+The CRL is regenerated on bootstrap, master startup, and before an expiring
+CRL is served.
 
 ### 6.5 Client management
 ```bash
@@ -132,6 +141,14 @@ sudo natssl --mode=master --list-blocked
 ---
 
 ## 7. Disaster Recovery
+
+Install `ping` (iputils) for the safety checks; missing or failed probe tools
+block promotion. Fence the old master before promotion: failed network probes cannot distinguish
+an outage from a network partition and do not guarantee the absence of split-brain.
+Stop `natssl-client` on the host being promoted before running the foreground
+promotion command, since both roles need port 8443. After successful promotion,
+use the master systemd unit for subsequent starts; disable the client unit.
+
 
 ```mermaid
 flowchart TD
@@ -149,7 +166,8 @@ flowchart TD
 ```
 
 The locally stored `network-cache.enc` carries the **full state**: Root CA,
-clients, issued certs, the **revoked set**, and the **blacklist**. A promoted
+clients, issued certs (including mTLS identities), the **revoked set**, the
+**blacklist**, enrollment policy and the monotonic replication/CRL counters. A promoted
 master is therefore fully functional and knows the last replicated state.
 
 > **Freshness:** equals the client's last successful sync before the master
@@ -166,17 +184,18 @@ master is therefore fully functional and knows the last replicated state.
 | Pin ambiguity | ✅ Pin to Root CA, fail-closed |
 | Host impersonation by clients | ✅ Loopback-only (twice) |
 | Re-registration of rogue host | ✅ `--block` (immediate) |
-| Revocation | ✅ Signed CRL, pushed + pullable, propagated immediately |
+| Revocation | ✅ Signed CRL over mTLS, published immediately and received on next pull |
 | DR completeness | ✅ Snapshot restores certs + revoked + blacklist |
 | Shared token | ⚠️ Rotate on compromise |
-| Master→client push transport | ⚠️ Unpinned, but cache sealed and CRL signed |
+| Replication | ✅ Pull-only mTLS; signed cache envelope and persisted sequence reject rollback |
+| Migration transport | ⚠️ Unpinned TLS; Root CA signature, freshness and persistent replay checks authenticate announcements |
 
 ---
 
 ## 9. Diagnostics
 
 ```bash
-journalctl -u natssl-master | grep -i "registered\|signed\|DENIED\|CRL\|pushed"
+journalctl -u natssl-master | grep -i "enrolled\|signed\|denied\|CRL\|master online"
 journalctl -u natssl-client | grep -i "pull\|enroll\|fingerprint\|CRL"
 openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
 openssl crl  -in /var/lib/natssl/root-ca.crl -noout -text
@@ -201,11 +220,32 @@ openssl crl  -in /var/lib/natssl/root-ca.crl -noout -text
 
 **Reissue vs revoke?** `--revoke <serial>` only revokes. `--reissue <subject>`
 revokes the current cert(s) for that subject **and** issues a fresh one, then
-propagates immediately.
+publishes the result immediately; clients receive it on their next pull.
 
-**Where is the CRL?** `/var/lib/natssl/root-ca.crl`, served at `/crl` (`:443`)
-and pushed to `/crl/push` (`:8443`).
+**Where is the CRL?** `/var/lib/natssl/root-ca.crl`, served only to enrolled clients at `/sync/crl` (`:8443`, mTLS).
 
 **Does a promoted master know about revocations?** Yes — the snapshot includes
 revoked serials and the blacklist; the CRL is regenerated on promotion.
 
+
+## 12. Protocol upgrade and local development
+
+Upgrade master and clients together: the control plane now requires enrolled
+mTLS identities. Existing unsigned caches may be replaced by a newly signed
+snapshot during authenticated synchronization, but are never accepted as a
+recovery source. Perform a successful sync after upgrading, before relying on DR.
+Root CA material is retained; do not bootstrap over an existing CA.
+
+For custom ports set client `master_address: "host:9443"` and
+`master_mgmt_address: "host:9843"`. IPv6 addresses with ports must be bracketed.
+The latter defaults to the master host on 8443. For DNS hosts configure
+`server_names: ["master.internal"]` on the master. Migration announcements use
+the standard client receiver port 8443 and announce the standard master ports.
+Use those ports for production DR.
+
+Run `CGO_ENABLED=1 go test -race ./...`, `go vet ./...`, and the pure-Go Linux
+amd64/arm64 builds. Integration tests create private temporary CAs, start real
+TLS endpoints and exercise enrollment, issuance, revocation, replication,
+rollback protection and recovery state. They do not install OS trust anchors or
+change Firefox profiles. OS/Firefox integration and service-manager deployment
+need validation on the target distribution.

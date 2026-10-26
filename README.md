@@ -95,8 +95,10 @@ Output:
 
 ```
 dist/
-├── natssl-1.0.7-oss-linux-amd64.tar.gz
-├── natssl-1.0.7-oss-linux-arm64.tar.gz
+├── natssl-1.0.9-oss-linux-amd64.tar.gz
+├── natssl-1.0.9-oss-linux-arm64.tar.gz
+├── natssl-1.0.9-oss-darwin-amd64.tar.gz
+├── natssl-1.0.9-oss-darwin-arm64.tar.gz
 └── SHA256SUMS.txt
 ```
 
@@ -109,8 +111,8 @@ Pack the source tree:
 Install:
 
 ```bash
-tar -xzf natssl-1.0.7-oss-linux-amd64.tar.gz
-sudo install -m 0755 natssl-1.0.7-oss-linux-amd64 /usr/local/bin/natssl
+tar -xzf natssl-1.0.9-oss-linux-amd64.tar.gz
+sudo install -m 0755 natssl-1.0.9-oss-linux-amd64 /usr/local/bin/natssl
 natssl --version
 ```
 
@@ -176,7 +178,7 @@ Four independent controls:
 - The signed migration broadcast (`:8443 /migrate`) is delivered over an
   unverified transport, but the **payload is ECDSA-signed by the Root CA** and
   verified by the receiver.
-- Revocation is a propagated list (`/sync/crl`), not full CRL/OCSP yet.
+- Revocation is a signed X.509 CRL (`/sync/crl`); OCSP is not implemented.
 </details>
 
 ---
@@ -214,8 +216,8 @@ minted; revoke the old one with `--revoke` if needed).
 /var/lib/natssl/issued/192.168.1.2.key   # private key  (0600)
 ```
 
-The certificate is also recorded in the database and the encrypted cache is
-rebuilt automatically, so it propagates to clients on their next pull.
+The certificate is also recorded in the database and the signed encrypted cache is
+rebuilt automatically, so it propagates to clients on their next authenticated pull.
 
 **Verify the SAN** (browsers ignore CommonName and read only the SAN):
 
@@ -359,6 +361,7 @@ sudo natssl --mode=master --list-certs
 mode: master
 data_dir: /var/lib/natssl
 listen: { acme: ":443", mgmt: ":8443" }
+server_names: ["master.internal"] # optional extra DNS names for the TLS leaf
 recovery_public_key: ""          # auto-filled on bootstrap
 enrollment_token: "REPLACE_ME"   # REQUIRED when client_networks is set
 client_networks:
@@ -381,6 +384,8 @@ ping_interval: 5m
 | Field | Where | Purpose |
 |---|---|---|
 | `enrollment_token` | both | Shared secret to enroll. **Mandatory** on the master when `client_networks` is set (fail-closed). |
+| `server_names` | master | Extra DNS SANs when clients address the master by DNS name. |
+| `master_mgmt_address` | client | Optional control-plane host:port; defaults to master host on 8443. |
 | `master_fingerprint` | client | SHA-256 of the master Root CA. Clients pin to it. |
 | `client_networks` | master | CIDRs allowed to self-register. |
 | `recovery_public_key` | both | Auto-filled on bootstrap; needed to decrypt the cache during recovery. |
@@ -398,7 +403,8 @@ openssl x509 -in /var/lib/natssl/root-ca.crt -noout -fingerprint -sha256
 sudo natssl --mode=client --promote-to-master --token="word1 ... word24"
 ```
 
-Safety chain before activation: TCP health (443/8443) → ICMP+ARP → local IP
+Stop the client service on the host being promoted and fence the old master first.
+Network probes alone cannot rule out a network partition. Safety chain before activation: TCP health (443/8443) → ICMP+ARP → local IP
 conflict. The Root CA is restored **byte-for-byte** (same fingerprint), so
 existing client pins keep working; only `master_address` changes (delivered via
 the signed migration packet). The promoted master also restores the last
@@ -430,6 +436,19 @@ local encrypted cache. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 | `--version` | Show version |
 
 ---
+
+## Development checks
+
+```bash
+go vet ./...
+make test            # enables CGO for the race detector only
+CGO_ENABLED=0 go build ./...
+```
+
+Tests use temporary CAs and real TLS/mTLS endpoints; they do not modify OS or
+Firefox trust stores. Upgrade master and clients together and complete a fresh
+sync: legacy unsigned caches are not accepted for disaster recovery. See the
+[deployment guide](docs/DEPLOYMENT.md#12-protocol-upgrade-and-local-development).
 
 ## License
 

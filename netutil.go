@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"net/http"
@@ -41,9 +42,8 @@ func tcpHealthy(h string, timeout time.Duration, ports ...int) bool {
 	return false
 }
 
-// insecureMasterClient is used ONLY for master->client cache/CRL push, where
-// the payload is already AES-GCM encrypted+sealed (cache) or publicly signed
-// (CRL), and the client receiver uses an ephemeral self-signed cert.
+// insecureMasterClient is used only to deliver Root-CA-signed migration packets.
+// The receiver authenticates their signature and rejects stale announcements.
 func insecureMasterClient() *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
@@ -57,59 +57,99 @@ func insecureMasterClient() *http.Client {
 }
 
 // pinnedMasterClient authenticates the MASTER via Root CA pinning (client->master
-// path: /ca, /cache, /crl, /acme/*).
+// path: bootstrap, enrollment and mTLS control plane).
 func pinnedMasterClient(cfg *Config) *http.Client {
 	tlsCfg := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true, // hostname check disabled; pin enforced below
+		InsecureSkipVerify: true, // normal verification is replaced with pin + chain + hostname checks below
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			return verifyMasterPin(cfg, rawCerts)
 		},
 	}
 	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		Timeout:       30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Transport:     &http.Transport{TLSClientConfig: tlsCfg},
 	}
 }
 
-// verifyMasterPin enforces Root CA pinning for the master connection.
+// verifyMasterPin verifies the complete server chain against exactly the pinned
+// Root CA. Merely appending that CA to an unrelated TLS chain is insufficient.
 func verifyMasterPin(cfg *Config, rawCerts [][]byte) error {
 	if len(rawCerts) == 0 {
 		return fmt.Errorf("master presented no certificate")
 	}
-
-	if want := normalizeFingerprint(cfg.MasterFingerprint); want != "" {
-		for _, der := range rawCerts {
-			if certFingerprint(der) == want {
-				return nil
-			}
-		}
-		return fmt.Errorf("master certificate fingerprint mismatch (expected %s…)", shorten(want))
-	}
-
-	if caPEM, err := os.ReadFile(cfg.caCertPath()); err == nil {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caPEM) {
-			return fmt.Errorf("local Root CA file is not valid PEM")
-		}
-		leaf, err := x509.ParseCertificate(rawCerts[0])
+	certs := make([]*x509.Certificate, 0, len(rawCerts))
+	for _, der := range rawCerts {
+		cert, err := x509.ParseCertificate(der)
 		if err != nil {
 			return fmt.Errorf("parse master certificate: %w", err)
 		}
-		inter := x509.NewCertPool()
-		for _, der := range rawCerts[1:] {
-			if c, e := x509.ParseCertificate(der); e == nil {
-				inter.AddCert(c)
+		certs = append(certs, cert)
+	}
+	if certs[0].Subject.CommonName != "natssl-master-api" {
+		return fmt.Errorf("master must present its dedicated server identity")
+	}
+	if certs[0].IsCA {
+		return fmt.Errorf("master must serve a dedicated server leaf, not the Root CA")
+	}
+	var root *x509.Certificate
+	want := normalizeFingerprint(cfg.MasterFingerprint)
+	if want != "" {
+		if len(want) != 64 {
+			return fmt.Errorf("invalid master_fingerprint")
+		}
+		if _, err := hex.DecodeString(want); err != nil {
+			return fmt.Errorf("invalid master_fingerprint")
+		}
+		for _, cert := range certs {
+			if cert.IsCA && certFingerprint(cert.Raw) == want {
+				root = cert
 			}
 		}
-		if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, Intermediates: inter}); err != nil {
-			return fmt.Errorf("master certificate does not chain to local Root CA: %w", err)
-		}
-		return nil
 	}
+	if data, err := os.ReadFile(cfg.caCertPath()); err == nil {
+		if cert, err := parseRootCA(data); err == nil && (want == "" || certFingerprint(cert.Raw) == want) {
+			root = cert
+		}
+	}
+	if root == nil {
+		return fmt.Errorf("cannot verify master: set master_fingerprint or install the pinned Root CA")
+	}
+	roots, inter := x509.NewCertPool(), x509.NewCertPool()
+	roots.AddCert(root)
+	for _, cert := range certs[1:] {
+		inter.AddCert(cert)
+	}
+	if _, err := certs[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: inter, DNSName: host(cfg.MasterAddress), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+		return fmt.Errorf("master certificate does not chain to pinned Root CA: %w", err)
+	}
+	return nil
+}
 
-	return fmt.Errorf("cannot verify master: set master_fingerprint in config " +
-		"or install the Root CA locally first")
+func parseRootCA(data []byte) (*x509.Certificate, error) {
+	b, _ := pem.Decode(data)
+	if b == nil || b.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("Root CA is not valid PEM")
+	}
+	cert, err := x509.ParseCertificate(b.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	if !cert.IsCA || cert.CheckSignatureFrom(cert) != nil {
+		return nil, fmt.Errorf("not a self-signed Root CA")
+	}
+	return cert, nil
+}
+
+func mtlsClient(cfg *Config) (*http.Client, error) {
+	cert, err := tls.LoadX509KeyPair(cfg.identityCertPath(), cfg.identityKeyPath())
+	if err != nil {
+		return nil, err
+	}
+	client := pinnedMasterClient(cfg)
+	client.Transport.(*http.Transport).TLSClientConfig.Certificates = []tls.Certificate{cert}
+	return client, nil
 }
 
 // certFingerprint returns the lowercase, colon-free hex SHA-256 of a DER cert.
@@ -132,4 +172,3 @@ func shorten(s string) string {
 	}
 	return s
 }
-

@@ -2,17 +2,37 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // icmpAlive returns true if the host answers a single ICMP echo within ~1s.
 // Uses the system `ping` to avoid requiring raw-socket privileges.
 func icmpAlive(ip string) bool {
-	cmd := exec.Command("ping", "-c", "1", "-W", "1", ip)
-	return cmd.Run() == nil
+	alive, _ := probeICMP(ip)
+	return alive
+}
+
+func probeICMP(ip string) (bool, error) {
+	if _, err := exec.LookPath("ping"); err != nil {
+		return false, fmt.Errorf("ping is required for promotion safety checks: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "1", ip)
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("ICMP probe could not complete reliably: %w", err)
 }
 
 // arpKnown reports whether the given IP has a resolved (non-zero) entry in the

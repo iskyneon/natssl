@@ -18,17 +18,20 @@ type Listen struct {
 
 // Config is the on-disk configuration shared by master and client modes.
 type Config struct {
-	Mode              string        `yaml:"mode"`                // master | client
-	DataDir           string        `yaml:"data_dir"`            // /var/lib/natssl
-	Listen            Listen        `yaml:"listen"`              // ports
-	MasterAddress     string        `yaml:"master_address"`      // client -> master host/IP
-	MasterFingerprint string        `yaml:"master_fingerprint"`  // client: SHA-256 of master Root CA (pinning)
-	RecoveryPublicKey string        `yaml:"recovery_public_key"` // base64, auto-filled on bootstrap
-	EnrollmentToken   string        `yaml:"enrollment_token"`    // shared secret for /acme/register
-	ClientNetworks    []string      `yaml:"client_networks"`     // master: CIDRs allowed to self-register
-	Clients           []string      `yaml:"clients"`             // optional static push targets (fallback)
-	PullInterval      time.Duration `yaml:"pull_interval"`       // cache pull/push cadence
-	PingInterval      time.Duration `yaml:"ping_interval"`       // master health-check cadence
+	Mode              string        `yaml:"mode"`                   // master | client
+	DataDir           string        `yaml:"data_dir"`               // /var/lib/natssl
+	Listen            Listen        `yaml:"listen"`                 // ports
+	ServerNames       []string      `yaml:"server_names,omitempty"` // extra DNS names in the server leaf
+	LastMigration     time.Time     `yaml:"last_migration,omitempty"`
+	MasterMgmtAddress string        `yaml:"master_mgmt_address,omitempty"` // optional control address, defaults to master host:8443
+	MasterAddress     string        `yaml:"master_address"`                // client -> master host/IP
+	MasterFingerprint string        `yaml:"master_fingerprint"`            // client: SHA-256 of master Root CA (pinning)
+	RecoveryPublicKey string        `yaml:"recovery_public_key"`           // base64, auto-filled on bootstrap
+	EnrollmentToken   string        `yaml:"enrollment_token"`              // shared secret for /acme/register
+	ClientNetworks    []string      `yaml:"client_networks"`               // master: CIDRs allowed to self-register
+	Clients           []string      `yaml:"clients"`                       // optional initial registered client IPs
+	PullInterval      time.Duration `yaml:"pull_interval"`                 // cache pull cadence
+	PingInterval      time.Duration `yaml:"ping_interval"`                 // master health-check cadence
 
 	path string `yaml:"-"` // source file path (not serialized)
 }
@@ -92,7 +95,7 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.path, b, 0o644)
+	return atomicWriteFile(c.path, b, 0o600)
 }
 
 // ClientAllowed reports whether a peer IP is permitted to self-register.
@@ -118,3 +121,22 @@ func (c *Config) cachePath() string  { return filepath.Join(c.DataDir, "network-
 func (c *Config) crlPath() string    { return filepath.Join(c.DataDir, "root-ca.crl") }
 func (c *Config) issuedDir() string  { return filepath.Join(c.DataDir, "issued") }
 
+func (c *Config) identityCertPath() string { return filepath.Join(c.DataDir, "client-identity.crt") }
+func (c *Config) identityKeyPath() string  { return filepath.Join(c.DataDir, "client-identity.key") }
+
+// Preserve an explicit bootstrap port and correctly bracket IPv6 addresses.
+func (c *Config) masterURL(control bool, path string) string {
+	addr := c.MasterAddress
+	port := "443"
+	if control {
+		addr = c.MasterMgmtAddress
+		if addr == "" {
+			addr = host(c.MasterAddress)
+		}
+		port = "8443"
+	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		addr = net.JoinHostPort(host(addr), port)
+	}
+	return "https://" + addr + path
+}

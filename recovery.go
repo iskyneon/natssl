@@ -25,6 +25,7 @@ func GenerateRecovery() (*RecoveryKey, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	defer clear(entropy)
 	rk, err := recoveryFromEntropy(entropy)
 	if err != nil {
 		return nil, "", err
@@ -52,6 +53,7 @@ func RecoveryFromMnemonic(mnemonic string) (*RecoveryKey, error) {
 	if err != nil {
 		return nil, errors.New("invalid 24-word seed phrase: " + err.Error())
 	}
+	defer clear(entropy)
 	return recoveryFromEntropy(entropy)
 }
 
