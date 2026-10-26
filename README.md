@@ -1,13 +1,19 @@
 # NATSSL
 
+<p align="center">
+  <img src="assets/natssl.png" alt="NATSSL logo" width="260">
+</p>
+
 **Zero-Configuration Distributed TLS for Private Infrastructure.**
 
 A single binary acting as a Certificate Authority (Root CA) for private
 networks, with disaster recovery via a 24-word BIP-39 seed phrase — no mDNS,
 no cloud.
 
-![status](https://img.shields.io/badge/version-1.0.10--oss-blue)
-![platform](https://img.shields.io/badge/linux-amd64%20%7C%20arm64-informational)
+[![release](https://img.shields.io/github/v/release/iskyneon/natssl?label=version&color=blue)](https://github.com/iskyneon/natssl/releases/latest)
+[![CI](https://github.com/iskyneon/natssl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/iskyneon/natssl/actions/workflows/ci.yml)
+![platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-informational)
+![architecture](https://img.shields.io/badge/architecture-amd64%20%7C%20arm64-informational)
 
 ---
 
@@ -15,6 +21,7 @@ no cloud.
 - [Features](#features)
 - [Architecture](#architecture)
 - [Requirements](#requirements)
+- [Download](#download)
 - [Building](#building)
 - [Quick Start](#quick-start)
 - [Security Model](#security-model)
@@ -77,9 +84,43 @@ and issued certificates — it is never used as an online TLS key.
 
 ## Requirements
 
-- **Go 1.22+** (build)
-- Linux: Ubuntu/Debian/CentOS/RHEL/Rocky
-- Firefox integration: `certutil` (`libnss3-tools` / `nss-tools`)
+- Prebuilt binaries: **Linux and macOS**, **amd64 and arm64**
+- **Go 1.22+** (only when building from source)
+- Linux systemd/Ansible deployment: Ubuntu/Debian/CentOS/RHEL/Rocky
+- Automatic OS/Firefox trust installation: Linux, with `certutil` (`libnss3-tools` / `nss-tools`); on macOS, install the Root CA manually
+
+---
+
+## Download
+
+Get prebuilt binaries from the [latest release](https://github.com/iskyneon/natssl/releases/latest).
+The [1.0.10 release](https://github.com/iskyneon/natssl/releases/tag/1.0.10) includes:
+
+| Platform | Architecture | Download |
+|---|---|---|
+| Linux | amd64 (x86-64) | [natssl-1.0.10-oss-linux-amd64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-1.0.10-oss-linux-amd64.tar.gz) |
+| Linux | arm64 (aarch64) | [natssl-1.0.10-oss-linux-arm64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-1.0.10-oss-linux-arm64.tar.gz) |
+| macOS | amd64 (Intel) | [natssl-1.0.10-oss-darwin-amd64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-1.0.10-oss-darwin-amd64.tar.gz) |
+| macOS | arm64 (Apple Silicon) | [natssl-1.0.10-oss-darwin-arm64.tar.gz](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-1.0.10-oss-darwin-arm64.tar.gz) |
+
+[Source archive](https://github.com/iskyneon/natssl/releases/download/1.0.10/natssl-src-1.0.10.tar.gz)
+· [SHA256SUMS.txt](https://github.com/iskyneon/natssl/releases/download/1.0.10/SHA256SUMS.txt)
+
+Verify the downloaded archive before extracting it:
+
+```bash
+sha256sum --ignore-missing -c SHA256SUMS.txt  # Linux
+# macOS example (Apple Silicon); use your archive's filename:
+grep '  natssl-1.0.10-oss-darwin-arm64.tar.gz$' SHA256SUMS.txt | shasum -a 256 -c -
+```
+
+Native binaries include master and client modes. The
+[GHCR image](https://github.com/iskyneon/natssl/pkgs/container/natssl) is
+**client-only**, for Linux amd64/arm64:
+
+```bash
+docker pull ghcr.io/iskyneon/natssl:1.0.10
+```
 
 ---
 
