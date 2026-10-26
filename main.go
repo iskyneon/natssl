@@ -30,7 +30,7 @@ MASTER MODE:
   --mode=master --list-certs           List issued certificates (serial, subject, expiry, status)
   --mode=master --list-revoked         List revoked certificates
   --mode=master --list-clients         List registered clients (IP, registered-at)
-  --mode=master --deregister "<IP>"    Remove a registered client from the push list
+  --mode=master --deregister "<IP>"    Remove a registered client from the registry
   --mode=master --block "<IP>"         Blacklist a client IP (denies future registration); add --block-reason
   --mode=master --unblock "<IP>"       Remove a client IP from the blacklist
   --mode=master --list-blocked         List blacklisted client IPs
@@ -83,7 +83,7 @@ func main() {
 	}
 
 	cfg, err := LoadConfig(*configPath)
-	if err != nil && !*bootstrap {
+	if err != nil && (!*bootstrap || !os.IsNotExist(err)) {
 		log.Fatalf("config: %v", err)
 	}
 	if cfg == nil {
@@ -91,6 +91,9 @@ func main() {
 		cfg.path = *configPath
 	}
 
+	if *mode == "" {
+		*mode = cfg.Mode
+	}
 	switch *mode {
 	case "master":
 		if *bootstrap {

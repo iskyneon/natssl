@@ -9,49 +9,124 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"log"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"time"
 )
 
-// RunClient boots the client: refresh + install the Root CA, self-register with
-// the master, accept replicated cache + CRL pushes on :8443, and periodically
-// pull the cache. New certificate issuance is handled separately
-// (RunClientIssue) and is loopback-only.
+type migrationRequest struct {
+	packet MigrationPacket
+	result chan error
+}
+
+// Only signed migration announcements need an inbound listener. Cache and CRL
+// are fetched exclusively over the master's authenticated mTLS control plane.
 func RunClient(cfg *Config) error {
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
 	if cfg.MasterAddress == "" {
-		return fmt.Errorf("master_address is required in client mode")
+		return fmt.Errorf("master_address is required")
 	}
 	if cfg.MasterFingerprint == "" {
-		log.Printf("WARNING: master_fingerprint not set — the first /ca fetch cannot be pinned; " +
-			"set it from the master bootstrap output for full protection")
+		if _, err := os.Stat(cfg.caCertPath()); err != nil {
+			return fmt.Errorf("master_fingerprint or local Root CA is required")
+		}
 	}
-
-	log.Printf("client starting | master=%s", cfg.MasterAddress)
-
-	if err := fetchAndInstallRootCA(cfg); err != nil {
-		log.Printf("WARNING: could not install Root CA yet: %v (will retry on pull)", err)
+	changes := make(chan migrationRequest, 8)
+	receiverConfig := *cfg // immutable; the event loop owns changes to cfg
+	cert, err := ephemeralSelfSigned()
+	if err != nil {
+		return err
 	}
-
-	StartRegistrationLoop(cfg)
-	go runCacheReceiver(cfg)
-	go runPullLoop(cfg)
-
-	select {}
+	srv := newHTTPServer(cfg.Listen.Mgmt, migrationHandler(&receiverConfig, changes), &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}})
+	listener, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return err
+	}
+	defer srv.Close()
+	errs := make(chan error, 1)
+	go func() { errs <- srv.Serve(tls.NewListener(listener, srv.TLSConfig)) }()
+	register := func() {
+		if _, err := os.Stat(cfg.caCertPath()); err != nil {
+			if err := fetchAndInstallRootCA(cfg); err != nil {
+				log.Printf("Root CA bootstrap: %v", err)
+				return
+			}
+		}
+		if err := RegisterWithMaster(cfg); err != nil {
+			log.Printf("self-registration (READ-ONLY): %v", err)
+		}
+	}
+	pull := func() {
+		if err := pullOnce(cfg); err != nil {
+			log.Printf("pull (READ-ONLY): %v", err)
+		}
+	}
+	// Retry failed trust-store installation on subsequent registration ticks.
+	installOS, installFirefox := true, true
+	installTrust := func() {
+		data, err := os.ReadFile(cfg.caCertPath())
+		if err != nil {
+			return
+		}
+		root, err := parseRootCA(data)
+		if err != nil {
+			log.Printf("local Root CA: %v", err)
+			return
+		}
+		if want := normalizeFingerprint(cfg.MasterFingerprint); want != "" && certFingerprint(root.Raw) != want {
+			log.Printf("local Root CA fingerprint mismatch")
+			return
+		}
+		if installOS {
+			if err := InstallRootCAIntoOS(cfg.caCertPath()); err != nil {
+				log.Printf("OS trust store: %v", err)
+			} else {
+				installOS = false
+			}
+		}
+		if installFirefox {
+			if err := InstallRootCAIntoFirefox(cfg.caCertPath()); err != nil {
+				log.Printf("Firefox trust store: %v", err)
+			} else {
+				installFirefox = false
+			}
+		}
+	}
+	register()
+	installTrust()
+	pull()
+	ping := time.NewTicker(cfg.PingInterval)
+	defer ping.Stop()
+	sync := time.NewTicker(cfg.PullInterval)
+	defer sync.Stop()
+	for {
+		select {
+		case <-ping.C:
+			register()
+			installTrust()
+		case <-sync.C:
+			pull()
+		case req := <-changes:
+			err := applyMigration(cfg, &req.packet)
+			req.result <- err
+			if err == nil {
+				register()
+				pull()
+			}
+		case err := <-errs:
+			return err
+		}
+	}
 }
 
-// fetchAndInstallRootCA downloads the Root CA from the master over a pinned
-// connection and installs it into the OS + Firefox trust stores.
 func fetchAndInstallRootCA(cfg *Config) error {
-	url := fmt.Sprintf("https://%s:443/ca", host(cfg.MasterAddress))
-	resp, err := pinnedMasterClient(cfg).Get(url)
+	client := pinnedMasterClient(cfg)
+	defer client.CloseIdleConnections()
+	resp, err := client.Get(cfg.masterURL(false, "/ca"))
 	if err != nil {
 		return err
 	}
@@ -59,133 +134,67 @@ func fetchAndInstallRootCA(cfg *Config) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("master returned %d for /ca", resp.StatusCode)
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := readBounded(resp.Body)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(cfg.caCertPath(), data, 0o644); err != nil {
+	root, err := parseRootCA(data)
+	if err != nil {
+		return err
+	}
+	if want := normalizeFingerprint(cfg.MasterFingerprint); want != "" && certFingerprint(root.Raw) != want {
+		return fmt.Errorf("downloaded Root CA fingerprint mismatch")
+	}
+	// With a local trust anchor, a server cannot silently replace that anchor.
+	if previous, err := os.ReadFile(cfg.caCertPath()); err == nil {
+		old, err := parseRootCA(previous)
+		if err != nil {
+			return err
+		}
+		if !old.Equal(root) {
+			return fmt.Errorf("downloaded Root CA differs from local Root CA")
+		}
+	}
+	if err := atomicWriteFile(cfg.caCertPath(), data, 0o644); err != nil {
 		return err
 	}
 
-	// InstallRootCA writes the OS anchor, runs update-ca-certificates /
-	// update-ca-trust, AND installs into every Firefox profile via certutil.
-	if err := InstallRootCA(data); err != nil {
-		log.Printf("trust store: %v", err)
-	}
-	log.Printf("Root CA installed from master (%d bytes)", len(data))
 	return nil
 }
 
-// runCacheReceiver serves :8443 to accept replicated cache + CRL pushes.
-func runCacheReceiver(cfg *Config) {
-	cert, err := ephemeralSelfSigned()
+func pullOnce(cfg *Config) error {
+	client, err := mtlsClient(cfg)
 	if err != nil {
-		log.Fatalf("cache receiver: cannot create ephemeral cert: %v", err)
+		return err
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/cache/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/cache/push", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		data, err := io.ReadAll(r.Body)
+	defer client.CloseIdleConnections()
+	fetch := func(path string) ([]byte, error) {
+		resp, err := client.Get(cfg.masterURL(true, path))
 		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		if err := os.WriteFile(cfg.cachePath(), data, 0o600); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		log.Printf("cache received from master (%d bytes)", len(data))
-		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/crl/push", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		if err := os.WriteFile(cfg.crlPath(), data, 0o644); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		log.Printf("CRL received from master (%d bytes)", len(data))
-		w.Write([]byte("ok"))
-	})
-
-	srv := &http.Server{
-		Addr:    cfg.Listen.Mgmt, // :8443
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		},
-	}
-	log.Printf("cache receiver on %s", cfg.Listen.Mgmt)
-	if err := srv.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("cache receiver failed: %v", err)
-	}
-}
-
-// runPullLoop periodically pulls the encrypted cache + CRL from the master
-// (pinned) and refreshes the Root CA.
-func runPullLoop(cfg *Config) {
-	pull := func() {
-		if _, err := os.Stat(cfg.caCertPath()); err != nil {
-			if e := fetchAndInstallRootCA(cfg); e != nil {
-				log.Printf("pull: Root CA refresh failed: %v", e)
-			}
-		}
-		url := fmt.Sprintf("https://%s:443/cache", host(cfg.MasterAddress))
-		resp, err := pinnedMasterClient(cfg).Get(url)
-		if err != nil {
-			log.Printf("pull: master unreachable (READ-ONLY): %v", err)
-			return
+			return nil, err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			log.Printf("pull: master returned %d", resp.StatusCode)
-			return
+			return nil, fmt.Errorf("%s returned %d", path, resp.StatusCode)
 		}
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return
-		}
-		if err := os.WriteFile(cfg.cachePath(), data, 0o600); err != nil {
-			log.Printf("pull: cannot write cache: %v", err)
-			return
-		}
-		log.Printf("cache pulled from master (%d bytes)", len(data))
-
-		// Best-effort CRL refresh (non-fatal).
-		crlURL := fmt.Sprintf("https://%s:443/crl", host(cfg.MasterAddress))
-		if cresp, cerr := pinnedMasterClient(cfg).Get(crlURL); cerr == nil {
-			defer cresp.Body.Close()
-			if cresp.StatusCode == 200 {
-				if b, rerr := io.ReadAll(cresp.Body); rerr == nil && len(b) > 0 {
-					if werr := os.WriteFile(cfg.crlPath(), b, 0o644); werr == nil {
-						log.Printf("CRL pulled from master (%d bytes)", len(b))
-					}
-				}
-			}
-		}
+		return readBounded(resp.Body)
 	}
-
-	pull()
-	t := time.NewTicker(cfg.PullInterval)
-	defer t.Stop()
-	for range t.C {
-		pull()
+	data, err := fetch("/sync/cache")
+	if err != nil {
+		return err
 	}
+	if err := acceptCache(cfg, data); err != nil {
+		return err
+	}
+	crl, err := fetch("/sync/crl")
+	if err != nil {
+		return err
+	}
+	if err := acceptCRL(cfg, crl); err != nil {
+		return err
+	}
+	log.Printf("cache and signed CRL pulled from master")
+	return nil
 }
 
 // ephemeralSelfSigned creates a short-lived self-signed cert for the :8443
@@ -217,4 +226,3 @@ func ephemeralSelfSigned() (tls.Certificate, error) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
-

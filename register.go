@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -16,7 +15,7 @@ func buildRegisterRequest(cfg *Config, body []byte) (*http.Request, error) {
 	if cfg.MasterAddress == "" {
 		return nil, fmt.Errorf("master_address is empty; cannot self-register")
 	}
-	url := fmt.Sprintf("https://%s:443/acme/register", host(cfg.MasterAddress))
+	url := cfg.masterURL(false, "/acme/register")
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -36,13 +35,15 @@ func RegisterWithMaster(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	resp, err := pinnedMasterClient(cfg).Do(req)
+	client := pinnedMasterClient(cfg)
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		msg, _ := io.ReadAll(resp.Body)
+		msg, _ := readBounded(resp.Body)
 		return fmt.Errorf("registration rejected (%d): %s",
 			resp.StatusCode, strings.TrimSpace(string(msg)))
 	}

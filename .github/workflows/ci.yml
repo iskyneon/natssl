@@ -21,6 +21,9 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      - name: test (race detector)
+        run: CGO_ENABLED=1 go test -race ./...
+
       - name: build (amd64 + arm64)
         run: |
           GOOS=linux GOARCH=amd64 go build ./...

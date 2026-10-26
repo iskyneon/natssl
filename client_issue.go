@@ -12,13 +12,11 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"golang.org/x/crypto/scrypt"
 	"golang.org/x/term"
@@ -66,12 +64,6 @@ func RunClientIssue(cfg *Config, subject string, localhost bool) error {
 	}
 	localhost = true
 
-	// ReadOnly guard: the control plane lives on :8443 now.
-	if !tcpHealthy(host(cfg.MasterAddress), 3*time.Second, 8443) {
-		return fmt.Errorf("issue failed: master is OFFLINE (READ-ONLY mode). " +
-			"Existing certificates keep working; new issuance requires the master")
-	}
-
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return fmt.Errorf("generate key: %w", err)
@@ -96,6 +88,10 @@ func RunClientIssue(cfg *Config, subject string, localhost bool) error {
 
 	certPEM, err := requestCSRSign(cfg, string(csrPEM), string(pubPEM), localhost)
 	if err != nil {
+		return err
+	}
+
+	if err := validateIssuedCertificate(cfg, certPEM, key, subject); err != nil {
 		return err
 	}
 
@@ -130,10 +126,10 @@ func RunClientIssue(cfg *Config, subject string, localhost bool) error {
 	certPath := filepath.Join(cfg.issuedDir(), base+".crt")
 	keyPath := filepath.Join(cfg.issuedDir(), base+".key.enc")
 
-	if err := os.WriteFile(certPath, []byte(certPEM), 0o644); err != nil {
+	if err := atomicWriteFile(certPath, []byte(certPEM), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(keyPath, encKey, 0o600); err != nil {
+	if err := atomicWriteFile(keyPath, encKey, 0o600); err != nil {
 		return err
 	}
 
@@ -156,7 +152,7 @@ func requestCSRSign(cfg *Config, csrPEM, pubPEM string, localhost bool) (string,
 	if err != nil {
 		return "", fmt.Errorf("client identity required (enroll first): %w", err)
 	}
-	url := fmt.Sprintf("https://%s:8443/acme/sign-csr", host(cfg.MasterAddress))
+	url := cfg.masterURL(true, "/acme/sign-csr")
 	body, _ := json.Marshal(map[string]any{
 		"csr": csrPEM, "client_pub": pubPEM, "localhost": localhost,
 	})
@@ -165,7 +161,10 @@ func requestCSRSign(cfg *Config, csrPEM, pubPEM string, localhost bool) (string,
 		return "", fmt.Errorf("contact master: %w", err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	data, err := readBounded(resp.Body)
+	if err != nil {
+		return "", err
+	}
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("master rejected request (%d): %s",
 			resp.StatusCode, strings.TrimSpace(string(data)))
@@ -276,4 +275,46 @@ func sanitizeName(s string) string {
 		s = "cert"
 	}
 	return s
+}
+
+func validateIssuedCertificate(cfg *Config, certPEM string, key *ecdsa.PrivateKey, subject string) error {
+	b, _ := pem.Decode([]byte(certPEM))
+	if b == nil {
+		return fmt.Errorf("invalid issued certificate")
+	}
+	cert, err := x509.ParseCertificate(b.Bytes)
+	if err != nil {
+		return err
+	}
+	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok || !pub.Equal(&key.PublicKey) {
+		return fmt.Errorf("issued certificate public key mismatch")
+	}
+	caData, err := os.ReadFile(cfg.caCertPath())
+	if err != nil {
+		return err
+	}
+	ca, err := parseRootCA(caData)
+	if err != nil {
+		return err
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, DNSName: subject, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+		return err
+	}
+	if cert.IsCA || len(cert.EmailAddresses) > 0 || len(cert.URIs) > 0 {
+		return fmt.Errorf("unexpected issued certificate identity")
+	}
+	for _, d := range cert.DNSNames {
+		if d != "localhost" {
+			return fmt.Errorf("non-loopback DNS SAN")
+		}
+	}
+	for _, ip := range cert.IPAddresses {
+		if !ip.IsLoopback() {
+			return fmt.Errorf("non-loopback IP SAN")
+		}
+	}
+	return nil
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"math/big"
+	"net"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -28,19 +30,16 @@ func subjectNote(s string) string {
 // normalizeSerial lowercases and strips ':' so "AB:CD" == "abcd".
 func normalizeSerial(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
-	return strings.ReplaceAll(s, ":", "")
+	s = strings.ReplaceAll(s, ":", "")
+	if n, ok := new(big.Int).SetString(s, 16); ok && n.Sign() > 0 {
+		return n.Text(16)
+	}
+	return s
 }
 
-// propagateNow immediately fans the freshly-written encrypted cache and signed
-// CRL out to every registered client, instead of waiting for the master's
-// periodic ticker. Safe to call from the CLI process: both push helpers read
-// the on-disk cache/CRL files that the calling command has just rebuilt, so it
-// works whether or not a master daemon is also running. Failures are non-fatal
-// (a client that is offline will catch up on the next pull).
-func propagateNow(cfg *Config, st *Store) {
-	fmt.Println("propagating to clients now ...")
-	pushCacheToClients(cfg, st)
-	pushCRLToClients(cfg, st)
+// reportSnapshotPublished explains pull replication after an administrative change.
+func reportSnapshotPublished() {
+	fmt.Println("Snapshot updated; clients receive it on their next authenticated pull.")
 }
 
 // RunListCerts prints every certificate this master has issued, including its
@@ -184,7 +183,7 @@ func RunListBlocked(cfg *Config) error {
 }
 
 // RunRevokeCert revokes a certificate by serial, regenerates the CRL, rebuilds
-// the encrypted snapshot, and propagates immediately. Master-only.
+// the encrypted snapshot, and publishes the new snapshot. Master-only.
 func RunRevokeCert(cfg *Config, serial string) error {
 	serial = normalizeSerial(serial)
 	if serial == "" {
@@ -201,7 +200,11 @@ func RunRevokeCert(cfg *Config, serial string) error {
 	}
 	defer st.Close()
 
-	if already, _ := st.IsRevoked(serial); already {
+	already, err := st.IsRevoked(serial)
+	if err != nil {
+		return err
+	}
+	if already {
 		return fmt.Errorf("certificate %s is already revoked", serial)
 	}
 
@@ -227,86 +230,63 @@ func RunRevokeCert(cfg *Config, serial string) error {
 	}
 
 	fmt.Printf("Revoked certificate %s%s.\n", serial, subjectNote(subject))
-	propagateNow(cfg, st)
+	reportSnapshotPublished()
 	return nil
 }
 
 // RunReissueCert revokes the current certificate(s) for a subject and issues a
-// fresh one (revoke -> issue), then propagates immediately. Master-only.
+// fresh one (revoke -> issue), then publishes the new snapshot. Master-only.
 func RunReissueCert(cfg *Config, subject string, localhost bool) error {
-	subject = strings.TrimSpace(subject)
+	subject = canonicalTarget(subject)
 	if subject == "" {
-		return fmt.Errorf("--reissue requires a subject (domain or IP)")
+		return fmt.Errorf("--reissue requires a subject")
 	}
-
 	ca, err := LoadCA(cfg.caCertPath(), cfg.caKeyPath())
 	if err != nil {
-		return fmt.Errorf("no Root CA found (run --bootstrap first): %w", err)
+		return err
 	}
 	st, err := OpenStore(cfg.dbPath())
 	if err != nil {
 		return err
 	}
-
-	current, err := st.CertsBySubject(subject)
+	defer st.Close()
+	res, err := ca.Issue(subject, nil, localhost)
 	if err != nil {
-		st.Close()
 		return err
 	}
-	revokedSet, err := st.RevokedSet()
+	unlock, err := lockIssuance(cfg, subject)
 	if err != nil {
-		st.Close()
 		return err
 	}
-
-	revokedN := 0
-	for _, c := range current {
-		if revokedSet[c.SerialHex] {
-			continue
-		}
-		if err := st.RevokeCert(c.SerialHex, c.Subject, crlReasonSuperseded); err != nil {
-			st.Close()
-			return fmt.Errorf("revoke previous cert %s: %w", c.SerialHex, err)
-		}
-		fmt.Printf("revoked previous certificate for %q (serial %s)\n", subject, c.SerialHex)
-		revokedN++
+	defer unlock()
+	if err := writeIssuedFiles(cfg, subject, res); err != nil {
+		return err
 	}
-	if revokedN == 0 {
-		fmt.Printf("no active certificate found for %q — issuing a fresh one.\n", subject)
+	rec := certRecord(res.Cert, res.CertPEM)
+	rec.Subject = subject
+	n, err := st.replaceCertificate(rec)
+	if err != nil {
+		return err
 	}
-
 	if err := WriteCRL(cfg, ca, st); err != nil {
-		st.Close()
-		return fmt.Errorf("write CRL: %w", err)
+		return fmt.Errorf("reissued in DB, but CRL update failed: %w", err)
 	}
 	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
-		st.Close()
-		return fmt.Errorf("rebuild cache after revoke: %w", err)
+		return fmt.Errorf("reissued, but snapshot update failed: %w", err)
 	}
-	st.Close() // RunIssueCLI opens its own store/CA session.
-
-	fmt.Println("issuing replacement certificate ...")
-	if err := RunIssueCLI(cfg, subject, localhost); err != nil {
-		return err
-	}
-
-	// Reopen to propagate the final state (CRL + cache including the new cert).
-	st2, err := OpenStore(cfg.dbPath())
-	if err != nil {
-		return fmt.Errorf("reissued, but cannot reopen store to propagate: %w", err)
-	}
-	defer st2.Close()
-	propagateNow(cfg, st2)
+	fmt.Printf("Reissued certificate for %q; revoked %d previous certificate(s).\n", subject, n)
+	reportSnapshotPublished()
 	return nil
 }
 
-// RunDeregisterClient removes a client from the push list, rebuilds the
-// snapshot, and propagates immediately. Master-only.
+// RunDeregisterClient removes a client from the registry, rebuilds the
+// snapshot, and publishes the new snapshot. Master-only.
 func RunDeregisterClient(cfg *Config, ip string) error {
 	ip = strings.TrimSpace(ip)
-	if ip == "" {
+	if net.ParseIP(ip) == nil {
 		return fmt.Errorf("--deregister requires a client IP")
 	}
+	ip = net.ParseIP(ip).String()
 
 	ca, err := LoadCA(cfg.caCertPath(), cfg.caKeyPath())
 	if err != nil {
@@ -333,8 +313,8 @@ func RunDeregisterClient(cfg *Config, ip string) error {
 		return fmt.Errorf("client removed, but cache rebuild failed: %w", err)
 	}
 
-	fmt.Printf("Deregistered client %s (removed from push list and snapshot).\n", ip)
-	propagateNow(cfg, st) // remaining clients get the updated snapshot now
+	fmt.Printf("Deregistered client %s (removed from registry and snapshot).\n", ip)
+	reportSnapshotPublished() // clients receive the new state on their next pull
 	fmt.Println("------------------------------------------------------------")
 	fmt.Println("NOTE: if natssl-client is still RUNNING on that host, it will")
 	fmt.Println("      RE-REGISTER on its next ping. To keep it out for good,")
@@ -343,12 +323,13 @@ func RunDeregisterClient(cfg *Config, ip string) error {
 }
 
 // RunBlockClient blacklists a client IP (denying future self-registration),
-// drops it from the push list, and propagates immediately. Master-only.
+// drops it from the registry, and publishes the new snapshot. Master-only.
 func RunBlockClient(cfg *Config, ip, reason string) error {
 	ip = strings.TrimSpace(ip)
-	if ip == "" {
+	if net.ParseIP(ip) == nil {
 		return fmt.Errorf("--block requires a client IP")
 	}
+	ip = net.ParseIP(ip).String()
 
 	ca, err := LoadCA(cfg.caCertPath(), cfg.caKeyPath())
 	if err != nil {
@@ -364,7 +345,7 @@ func RunBlockClient(cfg *Config, ip, reason string) error {
 		return fmt.Errorf("blacklist: %w", err)
 	}
 	if err := st.RemoveClient(ip); err != nil {
-		return fmt.Errorf("blocked, but failed to drop from push list: %w", err)
+		return fmt.Errorf("blocked, but failed to drop from registry: %w", err)
 	}
 	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
 		return fmt.Errorf("blocked, but cache rebuild failed: %w", err)
@@ -372,18 +353,19 @@ func RunBlockClient(cfg *Config, ip, reason string) error {
 
 	fmt.Printf("Blocked %s%s.\n", ip, parenIf(reason))
 	fmt.Println("Future /acme/register from this IP will be DENIED, and it has")
-	fmt.Println("been removed from the active push list. A running master picks")
+	fmt.Println("been removed from the active registry. A running master picks")
 	fmt.Println("this up immediately (same SQLite DB) — no restart required.")
-	propagateNow(cfg, st)
+	reportSnapshotPublished()
 	return nil
 }
 
-// RunUnblockClient removes an IP from the blacklist and propagates. Master-only.
+// RunUnblockClient removes an IP from the blacklist and publishes a snapshot. Master-only.
 func RunUnblockClient(cfg *Config, ip string) error {
 	ip = strings.TrimSpace(ip)
-	if ip == "" {
+	if net.ParseIP(ip) == nil {
 		return fmt.Errorf("--unblock requires a client IP")
 	}
+	ip = net.ParseIP(ip).String()
 
 	ca, err := LoadCA(cfg.caCertPath(), cfg.caKeyPath())
 	if err != nil {
@@ -410,7 +392,6 @@ func RunUnblockClient(cfg *Config, ip string) error {
 	}
 
 	fmt.Printf("Unblocked %s. It may self-register again on its next ping.\n", ip)
-	propagateNow(cfg, st)
+	reportSnapshotPublished()
 	return nil
 }
-

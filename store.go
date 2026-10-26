@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -51,20 +52,28 @@ type ClientInfo struct {
 //
 // CACertPEM / CAKeyPEM are PEM strings — matches promote.go's restore path.
 type Snapshot struct {
-	Version     int             `json:"version"`
-	CreatedAt   time.Time       `json:"created_at"`
-	Fingerprint string          `json:"fingerprint"`
-	CACertPEM   string          `json:"ca_cert_pem"`
-	CAKeyPEM    string          `json:"ca_key_pem"`
-	Clients     []string        `json:"clients"`
-	Certs       []CertRecord    `json:"certs"`
-	Revoked     []RevokedRecord `json:"revoked"`   // replicated so a promoted master keeps revocations
-	Blacklist   []BlockRecord   `json:"blacklist"` // replicated so a promoted master keeps blocks
+	Version         int             `json:"version"`
+	EnrollmentToken string          `json:"enrollment_token"`
+	ClientNetworks  []string        `json:"client_networks"`
+	CRLNumber       int64           `json:"crl_number"`
+	Sequence        uint64          `json:"sequence"`
+	CreatedAt       time.Time       `json:"created_at"`
+	Fingerprint     string          `json:"fingerprint"`
+	CACertPEM       string          `json:"ca_cert_pem"`
+	CAKeyPEM        string          `json:"ca_key_pem"`
+	Clients         []string        `json:"clients"`
+	Certs           []CertRecord    `json:"certs"`
+	Revoked         []RevokedRecord `json:"revoked"`   // replicated so a promoted master keeps revocations
+	Blacklist       []BlockRecord   `json:"blacklist"` // replicated so a promoted master keeps blocks
 }
 
 // Store wraps the SQLite database.
 type Store struct {
 	db *sql.DB
+	q  interface {
+		Query(string, ...any) (*sql.Rows, error)
+		QueryRow(string, ...any) *sql.Row
+	}
 }
 
 // OpenStore opens (creating if needed) the SQLite database and ensures schema.
@@ -74,7 +83,11 @@ func OpenStore(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1) // SQLite: serialize writes
-	s := &Store{db: db}
+	s := &Store{db: db, q: db}
+	if _, err := db.Exec(`PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL;`); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -84,6 +97,8 @@ func OpenStore(path string) (*Store, error) {
 
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+INSERT OR IGNORE INTO state(key,value) VALUES('cache_sequence',0);
 CREATE TABLE IF NOT EXISTS clients (
     ip TEXT PRIMARY KEY,
     added_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -139,7 +154,7 @@ func (s *Store) RemoveClient(ip string) error {
 
 // ListClients returns all registered client IPs.
 func (s *Store) ListClients() ([]string, error) {
-	rows, err := s.db.Query(`SELECT ip FROM clients ORDER BY ip`)
+	rows, err := s.q.Query(`SELECT ip FROM clients ORDER BY ip`)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +172,7 @@ func (s *Store) ListClients() ([]string, error) {
 
 // ListClientsInfo returns all registered clients with their added_at time.
 func (s *Store) ListClientsInfo() ([]ClientInfo, error) {
-	rows, err := s.db.Query(`SELECT ip, added_at FROM clients ORDER BY ip`)
+	rows, err := s.q.Query(`SELECT ip, added_at FROM clients ORDER BY ip`)
 	if err != nil {
 		return nil, err
 	}
@@ -176,8 +191,13 @@ func (s *Store) ListClientsInfo() ([]ClientInfo, error) {
 // --- certs ---------------------------------------------------------------
 
 // AddCert upserts an issued certificate record.
-func (s *Store) AddCert(rec CertRecord) error {
-	_, err := s.db.Exec(`
+type certWriter interface {
+	Exec(string, ...any) (sql.Result, error)
+}
+
+func (s *Store) AddCert(rec CertRecord) error { return insertCert(s.db, rec) }
+func insertCert(writer certWriter, rec CertRecord) error {
+	_, err := writer.Exec(`
 INSERT INTO certs(id, subject, sans, not_before, not_after, client_pub, serial_hex, cert_pem)
 VALUES(?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
@@ -192,7 +212,7 @@ ON CONFLICT(id) DO UPDATE SET
 
 // ListCerts returns all certificate records.
 func (s *Store) ListCerts() ([]CertRecord, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.q.Query(`
 SELECT id, subject, sans, not_before, not_after, client_pub, serial_hex, cert_pem
 FROM certs ORDER BY not_before`)
 	if err != nil {
@@ -213,7 +233,7 @@ FROM certs ORDER BY not_before`)
 
 // CertBySerial returns a single cert record by its hex serial.
 func (s *Store) CertBySerial(serial string) (*CertRecord, bool, error) {
-	row := s.db.QueryRow(`
+	row := s.q.QueryRow(`
 SELECT id, subject, sans, not_before, not_after, client_pub, serial_hex, cert_pem
 FROM certs WHERE serial_hex = ?`, serial)
 	var r CertRecord
@@ -230,9 +250,9 @@ FROM certs WHERE serial_hex = ?`, serial)
 
 // CertsBySubject returns all (issued) cert records whose subject matches.
 func (s *Store) CertsBySubject(subject string) ([]CertRecord, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.q.Query(`
 SELECT id, subject, sans, not_before, not_after, client_pub, serial_hex, cert_pem
-FROM certs WHERE subject = ? ORDER BY not_before`, subject)
+FROM certs WHERE lower(subject) = lower(?) ORDER BY not_before`, subject)
 	if err != nil {
 		return nil, err
 	}
@@ -253,9 +273,15 @@ FROM certs WHERE subject = ? ORDER BY not_before`, subject)
 
 // RevokeCert records a certificate serial as revoked (idempotent on serial).
 func (s *Store) RevokeCert(serialHex, subject string, reason int) error {
+	serialHex = normalizeSerial(serialHex)
+	n, ok := new(big.Int).SetString(serialHex, 16)
+	if !ok || n.Sign() <= 0 {
+		return fmt.Errorf("invalid certificate serial")
+	}
+	serialHex = n.Text(16)
 	_, err := s.db.Exec(`
 INSERT INTO revoked(serial_hex, subject, reason) VALUES(?,?,?)
-ON CONFLICT(serial_hex) DO UPDATE SET subject=excluded.subject, reason=excluded.reason`,
+ON CONFLICT(serial_hex) DO NOTHING`,
 		serialHex, subject, reason)
 	return err
 }
@@ -263,13 +289,13 @@ ON CONFLICT(serial_hex) DO UPDATE SET subject=excluded.subject, reason=excluded.
 // IsRevoked reports whether a serial is in the revoked set.
 func (s *Store) IsRevoked(serial string) (bool, error) {
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(1) FROM revoked WHERE serial_hex = ?`, serial).Scan(&n)
+	err := s.q.QueryRow(`SELECT COUNT(1) FROM revoked WHERE serial_hex = ?`, serial).Scan(&n)
 	return n > 0, err
 }
 
 // ListRevoked returns all revoked certificate records.
 func (s *Store) ListRevoked() ([]RevokedRecord, error) {
-	rows, err := s.db.Query(`SELECT serial_hex, subject, reason, revoked_at FROM revoked ORDER BY revoked_at`)
+	rows, err := s.q.Query(`SELECT serial_hex, subject, reason, revoked_at FROM revoked ORDER BY revoked_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -318,13 +344,13 @@ func (s *Store) UnblockIP(ip string) error {
 // IsBlocked reports whether an IP is blacklisted.
 func (s *Store) IsBlocked(ip string) (bool, error) {
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(1) FROM blacklist WHERE ip = ?`, strings.TrimSpace(ip)).Scan(&n)
+	err := s.q.QueryRow(`SELECT COUNT(1) FROM blacklist WHERE ip = ?`, strings.TrimSpace(ip)).Scan(&n)
 	return n > 0, err
 }
 
 // ListBlocked returns all blacklisted IPs.
 func (s *Store) ListBlocked() ([]BlockRecord, error) {
-	rows, err := s.db.Query(`SELECT ip, reason, added_at FROM blacklist ORDER BY ip`)
+	rows, err := s.q.Query(`SELECT ip, reason, added_at FROM blacklist ORDER BY ip`)
 	if err != nil {
 		return nil, err
 	}
@@ -344,6 +370,26 @@ func (s *Store) ListBlocked() ([]BlockRecord, error) {
 
 // BuildSnapshot assembles the full recoverable state for the encrypted cache.
 func (s *Store) BuildSnapshot(ca *CA) (*Snapshot, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	snap, err := (&Store{q: tx}).buildSnapshot(ca)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+func (s *Store) buildSnapshot(ca *CA) (*Snapshot, error) {
+	var crlNumber int64
+	if err := s.q.QueryRow(`SELECT COALESCE((SELECT value FROM state WHERE key='crl_number'),0)`).Scan(&crlNumber); err != nil {
+		return nil, err
+	}
 	clients, err := s.ListClients()
 	if err != nil {
 		return nil, err
@@ -366,6 +412,7 @@ func (s *Store) BuildSnapshot(ca *CA) (*Snapshot, error) {
 	}
 	return &Snapshot{
 		Version:     1,
+		CRLNumber:   crlNumber,
 		CreatedAt:   time.Now().UTC(),
 		Fingerprint: ca.Fingerprint(),
 		CACertPEM:   certPEM,
@@ -382,6 +429,9 @@ func (s *Store) BuildSnapshot(ca *CA) (*Snapshot, error) {
 // master that knows the LAST replicated state: clients, issued certs, revoked
 // serials AND the blacklist. Idempotent (clears then repopulates each table).
 func (s *Store) RestoreSnapshot(snap *Snapshot) error {
+	if snap == nil || snap.Version != 1 {
+		return fmt.Errorf("unsupported snapshot version")
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -440,6 +490,12 @@ VALUES(?,?,?)`, strings.TrimSpace(b.IP), b.Reason, ba); err != nil {
 		}
 	}
 
+	if _, err := tx.Exec(`UPDATE state SET value=MAX(value,?) WHERE key='cache_sequence'`, snap.Sequence); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO state(key,value) VALUES('crl_number',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)`, snap.CRLNumber); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -454,3 +510,55 @@ func caPEM(ca *CA) (certPEM, keyPEM string, err error) {
 	return string(cert), string(key), nil
 }
 
+func (s *Store) nextCacheSequence() (uint64, error) {
+	var n uint64
+	err := s.db.QueryRow(`UPDATE state SET value=value+1 WHERE key='cache_sequence' RETURNING value`).Scan(&n)
+	return n, err
+}
+func (s *Store) hasClient(ip string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(1) FROM clients WHERE ip=?`, ip).Scan(&n)
+	return n > 0, err
+}
+func (s *Store) registerClient(ip string) (bool, error) {
+	res, err := s.db.Exec(`INSERT OR IGNORE INTO clients(ip) VALUES(?)`, ip)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+func (s *Store) nextCRLNumber(floor int64) (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`INSERT INTO state(key,value) VALUES('crl_number',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value+1,excluded.value) RETURNING value`, floor).Scan(&n)
+	return n, err
+}
+
+// Publish the replacement and its revocations together; failed file generation
+// must not revoke a working certificate.
+func (s *Store) replaceCertificate(rec CertRecord) (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err := insertCert(tx, rec); err != nil {
+		return 0, err
+	}
+	result, err := tx.Exec(`INSERT INTO revoked(serial_hex,subject,reason)
+ SELECT serial_hex,subject,? FROM certs
+ WHERE lower(subject)=lower(?) AND serial_hex<>?
+ ON CONFLICT(serial_hex) DO NOTHING`, crlReasonSuperseded, rec.Subject, rec.SerialHex)
+	if err != nil {
+		return 0, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}

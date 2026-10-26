@@ -87,6 +87,9 @@ func LoadCA(certPath, keyPath string) (*CA, error) {
 	if !ok {
 		return nil, errors.New("CA key is not ECDSA")
 	}
+	if !cert.IsCA || cert.CheckSignatureFrom(cert) != nil || !key.PublicKey.Equal(cert.PublicKey) {
+		return nil, fmt.Errorf("invalid or mismatched Root CA key pair")
+	}
 	return &CA{Cert: cert, CertDER: cblock.Bytes, Key: key}, nil
 }
 
@@ -109,6 +112,9 @@ func LoadCAFromPEM(certPEM, keyPEM string) (*CA, error) {
 	if !ok {
 		return nil, errors.New("CA key is not ECDSA")
 	}
+	if !cert.IsCA || cert.CheckSignatureFrom(cert) != nil || !key.PublicKey.Equal(cert.PublicKey) {
+		return nil, fmt.Errorf("invalid or mismatched Root CA key pair")
+	}
 	return &CA{Cert: cert, CertDER: cblock.Bytes, Key: key}, nil
 }
 
@@ -119,10 +125,10 @@ func (ca *CA) SaveToFiles(certPath, keyPath string) error {
 		return err
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+	if err := atomicWriteFile(certPath, certPEM, 0o644); err != nil {
 		return err
 	}
-	return os.WriteFile(keyPath, keyPEM, 0o600) // CA key: strict perms
+	return atomicWriteFile(keyPath, keyPEM, 0o600) // CA key: strict perms
 }
 
 func (ca *CA) Fingerprint() string {
@@ -161,9 +167,10 @@ func (ca *CA) Issue(subject string, sans []string, localhostMode bool) (*IssueRe
 		return nil, err
 	}
 
-	notAfter := time.Now().AddDate(1, 0, 0)
+	notAfter := time.Now().Add(90 * 24 * time.Hour)
 	cn := subject
 	if localhostMode {
+		dnsNames, ips = loopbackSANs("localhost")
 		notAfter = time.Now().AddDate(1, 0, 0)
 		cn = "localhost (Same PC only)"
 		if !containsIP(ips, net.ParseIP("127.0.0.1")) {
@@ -180,7 +187,7 @@ func (ca *CA) Issue(subject string, sans []string, localhostMode bool) (*IssueRe
 		NotBefore:    time.Now().Add(-5 * time.Minute),
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     dnsNames,
 		IPAddresses:  ips,
 	}
@@ -203,9 +210,12 @@ func (ca *CA) SignCSR(csr *x509.CertificateRequest, localhostMode bool) (*IssueR
 	}
 	dnsNames := csr.DNSNames
 	ips := csr.IPAddresses
-	notAfter := time.Now().AddDate(1, 0, 0)
+	notAfter := time.Now().Add(90 * 24 * time.Hour)
 
 	if localhostMode {
+		if err := enforceLoopbackOnly(csr, true); err != nil {
+			return nil, err
+		}
 		for _, d := range dnsNames {
 			if d != "localhost" {
 				return nil, fmt.Errorf("localhost mode: only 'localhost' allowed, got %q", d)
@@ -227,7 +237,7 @@ func (ca *CA) SignCSR(csr *x509.CertificateRequest, localhostMode bool) (*IssueR
 		NotBefore:    time.Now().Add(-5 * time.Minute),
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     dnsNames,
 		IPAddresses:  ips,
 	}
@@ -330,13 +340,34 @@ func splitSANs(items []string) (dns []string, ips []net.IP) {
 
 // validIssuanceTarget: *.local, *.internal, any dotted DNS name, or any IP.
 func validIssuanceTarget(dns []string, ips []net.IP) bool {
-	for _, d := range dns {
-		if strings.HasSuffix(d, ".local") || strings.HasSuffix(d, ".internal") ||
-			strings.Contains(d, ".") {
-			return true
+	if len(dns)+len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		if ip == nil {
+			return false
 		}
 	}
-	return len(ips) > 0
+	for _, name := range dns {
+		if !strings.Contains(name, ".") {
+			return false
+		}
+		name = strings.TrimPrefix(name, "*.")
+		if len(name) > 253 {
+			return false
+		}
+		for _, label := range strings.Split(name, ".") {
+			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+				return false
+			}
+			for _, r := range label {
+				if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func contains(s []string, v string) bool {
@@ -370,6 +401,7 @@ func RunIssueCLI(cfg *Config, target string, localhost bool) error {
 	}
 	defer st.Close()
 
+	target = canonicalTarget(target)
 	res, err := ca.Issue(target, nil, localhost)
 	if err != nil {
 		return err
@@ -383,17 +415,23 @@ func RunIssueCLI(cfg *Config, target string, localhost bool) error {
 		SerialHex: res.Cert.SerialNumber.Text(16),
 		CertPEM:   res.CertPEM,
 	}
+
+	unlock, err := lockIssuance(cfg, target)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := writeIssuedFiles(cfg, target, res); err != nil {
+		return err
+	}
+	base := sanitizeName(target)
+
 	if err := st.AddCert(rec); err != nil {
 		return err
 	}
 	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
 		return err
 	}
-
-	os.MkdirAll(cfg.issuedDir(), 0o755)
-	base := strings.NewReplacer("*", "_", "/", "_", ":", "_").Replace(target)
-	os.WriteFile(cfg.issuedDir()+"/"+base+".crt", []byte(res.CertPEM), 0o644)
-	os.WriteFile(cfg.issuedDir()+"/"+base+".key", []byte(res.KeyPEM), 0o600)
 
 	fmt.Printf("Issued certificate for %q (serial %s, valid until %s)\n",
 		target, rec.SerialHex, rec.NotAfter.Format(time.RFC3339))
@@ -403,22 +441,48 @@ func RunIssueCLI(cfg *Config, target string, localhost bool) error {
 
 // RunRevoke marks a certificate (by serial hex) as revoked and rebuilds the
 // encrypted cache so the revocation propagates to clients.
-func RunRevoke(cfg *Config, serial string) error {
-	ca, err := LoadCA(cfg.caCertPath(), cfg.caKeyPath())
-	if err != nil {
-		return fmt.Errorf("no Root CA found: %w", err)
+func RunRevoke(cfg *Config, serial string) error { return RunRevokeCert(cfg, serial) }
+
+func ipsToStr(ips []net.IP) []string {
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, ip.String())
 	}
-	st, err := OpenStore(cfg.dbPath())
-	if err != nil {
+	return out
+}
+
+func canonicalTarget(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.String()
+	}
+	return s
+}
+
+func lockIssuance(cfg *Config, target string) (func(), error) {
+	if err := os.MkdirAll(cfg.issuedDir(), 0o700); err != nil {
+		return nil, err
+	}
+	return lockFile(cfg.issuedDir() + "/" + sanitizeName(target) + ".issue.lock")
+}
+
+func writeIssuedFiles(cfg *Config, target string, res *IssueResult) error {
+	base := cfg.issuedDir() + "/" + sanitizeName(target)
+	previous, readErr := os.ReadFile(base + ".key")
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return readErr
+	}
+	if err := atomicWriteFile(base+".key", []byte(res.KeyPEM), 0o600); err != nil {
 		return err
 	}
-	defer st.Close()
-	if err := st.RevokeCert(serial); err != nil {
-		return err
+	if err := atomicWriteFile(base+".crt", []byte(res.CertPEM), 0o644); err != nil {
+		var rollback error
+		if readErr == nil {
+			rollback = atomicWriteFile(base+".key", previous, 0o600)
+		} else {
+			rollback = os.Remove(base + ".key")
+		}
+		return errors.Join(err, rollback)
 	}
-	if err := RebuildEncryptedCache(cfg, ca, st); err != nil {
-		return err
-	}
-	fmt.Printf("Revoked certificate serial %s\n", serial)
 	return nil
 }

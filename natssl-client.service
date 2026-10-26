@@ -10,7 +10,7 @@ ExecStart=/usr/local/bin/natssl --mode=client --config=/etc/natssl/config.yaml
 Restart=on-failure
 RestartSec=3s
 
-# The client listens on :8443 (>1024, no bind privilege needed). CAP_NET_RAW is
+# The client listens on :8443 for signed migration announcements. CAP_NET_RAW is
 # kept as an ambient capability so the disaster-recovery promotion path
 # (`ping` during the safety chain) works even under NoNewPrivileges=true.
 AmbientCapabilities=CAP_NET_RAW
@@ -26,7 +26,7 @@ StateDirectoryMode=0750
 # ProtectSystem is therefore relaxed (full, not strict) and the trust-store
 # paths are explicitly allowed.
 ProtectSystem=full
-ReadWritePaths=/var/lib/natssl /usr/local/share/ca-certificates /etc/pki/ca-trust/source/anchors /etc/ssl/certs
+ReadWritePaths=/var/lib/natssl -/usr/local/share/ca-certificates -/etc/pki/ca-trust -/etc/ssl/certs /etc/natssl
 PrivateTmp=true
 ProtectKernelModules=true
 RestrictSUIDSGID=false
