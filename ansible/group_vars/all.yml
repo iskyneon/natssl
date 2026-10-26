@@ -1,5 +1,5 @@
 ---
-natssl_release_tag: "1.0.10"
+natssl_release_tag: "1.0.11"
 natssl_pkg_version: "{{ natssl_release_tag }}-oss"
 natssl_download_base: "https://github.com/iskyneon/natssl/releases/download"
 natssl_bin: "/usr/local/bin/natssl"

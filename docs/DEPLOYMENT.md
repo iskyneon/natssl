@@ -52,8 +52,8 @@ revoked identity certificates remain revoked.
 
 ```bash
 ARCH=$(uname -m); case "$ARCH" in x86_64) A=amd64;; aarch64|arm64) A=arm64;; esac
-tar -xzf natssl-1.0.10-oss-linux-$A.tar.gz
-sudo install -m0755 natssl-1.0.10-oss-linux-$A /usr/local/bin/natssl
+tar -xzf natssl-1.0.11-oss-linux-$A.tar.gz
+sudo install -m0755 natssl-1.0.11-oss-linux-$A /usr/local/bin/natssl
 sudo mkdir -p /etc/natssl /var/lib/natssl
 sudo apt-get install -y libnss3-tools ca-certificates iputils-ping   # Debian/Ubuntu
 sudo dnf install -y nss-tools iputils                            # RHEL/Rocky
@@ -252,10 +252,11 @@ need validation on the target distribution.
 
 ## 13. Container and Ansible roles
 
-The GHCR image is client-only (including its default mode); master, bootstrap,
-administrative commands and promotion are disabled in its compiled binary.
-Use the native master with either container or native clients. Containers retain
-state in a bind mount and do not automatically install trust on the host. See
+The GHCR image is master-only, by default. It supports bootstrap and master
+administration; client mode, client configs and promotion are disabled in its
+compiled binary. Native clients enroll against the container master's published
+ports. The container retains CA/database state in bind mounts and does not
+install trust on the host. See
 [docker deployment](../docker/README.md).
 
 The Ansible roles deploy the full native release, verify release SHA-256, preserve

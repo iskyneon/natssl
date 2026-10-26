@@ -24,6 +24,9 @@ type migrationRequest struct {
 // Only signed migration announcements need an inbound listener. Cache and CRL
 // are fetched exclusively over the master's authenticated mTLS control plane.
 func RunClient(cfg *Config) error {
+	if masterOnly {
+		return fmt.Errorf("master-only build: client mode is disabled")
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}

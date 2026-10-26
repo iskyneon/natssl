@@ -20,15 +20,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  client-image:
+  master-image:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-      NATSSL_TEST_IMAGE: natssl-client-smoke:local
-      NATSSL_TEST_BINARY: /tmp/natssl-master
+      NATSSL_TEST_IMAGE: natssl-master-smoke:local
+      NATSSL_TEST_BINARY: /tmp/natssl-client
     steps:
       - name: Validate release version
         if: github.event_name != 'pull_request'
@@ -43,9 +43,9 @@ jobs:
           go-version: '1.22.12'
           cache: true
 
-      - name: Verify client-only policy and build native test master
+      - name: Verify master-only policy and build native test client
         run: |
-          CGO_ENABLED=0 go test -tags=clientonly ./...
+          CGO_ENABLED=0 go test -tags=masteronly ./...
           CGO_ENABLED=0 go build -o "$NATSSL_TEST_BINARY" .
 
       - name: Set image metadata
@@ -79,7 +79,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Exercise client against a real native master
+      - name: Exercise container master with a real native client
         run: python3 tests/smoke_container.py
 
       - name: Authenticate to GHCR
@@ -90,7 +90,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Publish multi-platform client-only image
+      - name: Publish multi-platform master image
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:

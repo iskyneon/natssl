@@ -1,79 +1,87 @@
-# NATSSL client-only container
+# NATSSL master-only container
 
-`ghcr.io/iskyneon/natssl:1.0.10` runs only the **client** role, which is the
-binary's default mode. Linux amd64 and arm64 are published in one image index.
-Native release binaries are used for the master and disaster-recovery promotion.
+`ghcr.io/iskyneon/natssl:1.0.11` runs **only the master role**, which is also
+the default. Linux amd64 and arm64 are published in one image index. Clients
+run the full native release binaries, including when provisioned by Ansible.
 
-The `clientonly` build policy rejects master mode, bootstrap, promotion and
-administrative commands, including when bypassing the Docker entrypoint or
-mounting a master-mode config. This restriction is independent of Compose.
+The compiled `masteronly` policy rejects client mode, client configs, client
+issuance/decryption and client-to-master promotion. Bypassing the Docker
+entrypoint does not bypass this policy. Master bootstrap, administrative
+issuance/reissue/revocation and the mTLS control plane are supported.
 
-## Start a client
+## Prepare the master
 
 ```bash
 cd docker
 cp .env.example .env
-cp client/config.example.yaml client/config.yaml
+cp master/config.example.yaml master/config.yaml
 mkdir -p data
-chmod 700 client data
-chmod 600 client/config.yaml
+chmod 700 master data
+chmod 600 master/config.yaml
+openssl rand -hex 32
 ```
 
-Set `master_address`, `master_fingerprint`, `recovery_public_key` and the shared
-`enrollment_token` from the **native master**. Set `NATSSL_UID`/`NATSSL_GID` in
-`.env` to your host user's `id -u`/`id -g`, so the container can read the private
-config and write `data/`. For custom master ports also set
-`master_mgmt_address`.
+Put the generated token into `enrollment_token`, set the allowed client CIDRs,
+and replace `server_names` with the host IP/DNS names clients actually use.
+The TLS leaf must contain those externally reachable names; a Docker bridge IP
+alone is insufficient. Set `NATSSL_UID`/`NATSSL_GID` in `.env` to the directories'
+owner (`id -u` / `id -g`).
+
+The container runs without root/capabilities: internal port 9443 is mapped to
+host port 443, and internal 8443 to host port 8443. Native clients use those
+host ports. Set `NATSSL_BIND` to the intended host interface and allow access
+from your client networks.
+
+## Bootstrap once, then start
 
 ```bash
 docker compose pull
+docker compose run --rm natssl-master --bootstrap
+# Record the displayed 24-word recovery phrase offline.
 docker compose up -d
 docker compose ps
-docker compose logs --tail 50 natssl-client
+docker compose logs --tail 50 natssl-master
 ```
 
-For a local build use `docker compose up -d --build`. There is no ACME listener
-or CA bootstrap command in the image. Outbound HTTPS to the native master's
-443/8443 ports is sufficient for enrollment, issuance and pull replication.
+Bootstrap defaults to master mode and atomically updates `recovery_public_key`
+in `master/config.yaml`. The directory is mounted read/write for that rename.
+For a local build use `docker compose build` before bootstrap/start.
 
-The optional inbound 8443 mapping handles **signed migration announcements
-only**, never cache/CRL push. It binds loopback by default. To receive remote
-announcements set `MGMT_BIND` to a reachable host interface and restrict access
-with the host firewall. Container promotion remains disabled.
+Bootstrap only a new master state directory. For an existing master retain its
+original config, CA key/certificate and database; do not bootstrap over them.
+The client-only 1.0.10 image/state must not be treated as an initialized master.
+Do not reuse a client state directory as the `data/` directory of a new CA.
 
-## State and host trust
-
-Config is mounted as a directory because signed migration updates use atomic
-renames. `data/` retains the pinned Root CA, private client identity, signed
-recovery cache and CRL across restarts. Keep both directories private and back
-up state; removing the container does not remove these bind mounts.
-
-The image runs as UID/GID 1000 by default with capabilities dropped in Compose.
-It does **not** install trust anchors into the host or Firefox profiles.
-`install_trust: false` is the container default. To trust the CA on the host,
-verify the exported fingerprint and install `data/root-ca.crt` using the host's
-supported trust-store tools. The normal native client keeps automatic OS/Firefox
-installation enabled by default.
-
-Health checks require an enrolled, valid client identity and a synchronized
-cache. An unreachable master puts the client in READ-ONLY mode; synchronized
-state is retained. New issuance requires the master.
-
-## Issue a loopback certificate
+## Verify and administer
 
 ```bash
-docker compose exec natssl-client natssl --issue localhost --localhost
-docker compose exec natssl-client natssl --decrypt-key=/var/lib/natssl/issued/localhost.key.enc
+openssl x509 -in data/root-ca.crt -noout -fingerprint -sha256
+docker compose exec natssl-master natssl --issue app.internal
+docker compose exec natssl-master natssl --reissue app.internal
+docker compose exec natssl-master natssl --list-certs
+docker compose exec natssl-master natssl --revoke SERIAL_HEX
 ```
 
-Issuance prompts for the private-key encryption password. Decryption writes the
-PEM key to stdout; protect its destination. Domain/IP administration must run
-on the native master, not inside this image.
+Configure native clients with the published host address, Root CA fingerprint,
+enrollment token and recovery public key. Their mTLS identities are issued on
+enrollment; signed cache/CRL synchronization and CSR signing use port 8443.
+Arbitrary domain/IP issuance remains administrative CLI-only.
 
-## Publishing
+`data/` retains the CA, database, CRL, cache and issued certificates across
+container restarts. Back it up together with the private master config. Native
+clients install trust on their own hosts; the master container does not install
+trust into the Docker host or its browsers.
 
-`.github/workflows/container.yml` smoke-tests a real image against a native
-master, checks the client-only policy and offline state retention, then publishes
-`ghcr.io/iskyneon/natssl:<version>`, `<version>-oss` and `latest` for version tags.
-Pull requests run the smoke test without publishing. A repository's existing
-GHCR package must grant that repository Actions write access.
+Disaster-recovery promotion is a native-client operation: fence the old master
+and use the full native binary with the synchronized recovery state and seed.
+The master-only image does not run a client or accept `--promote-to-master`.
+
+## Publishing and verification
+
+`.github/workflows/container.yml` builds the master-only image, rejects client
+mode through direct flags/config/entrypoint override, bootstraps its CA and
+runs a real native client against it. Smoke checks cover verified HTTPS,
+mTLS enrollment/pull/CSR, CLI issue/reissue/revoke, persistent CA/database after
+restart and offline client state retention. Version tags publish
+`ghcr.io/iskyneon/natssl:<version>`, `<version>-oss` and `latest` for Linux
+amd64/arm64. Pull requests run the same smoke checks without publishing.

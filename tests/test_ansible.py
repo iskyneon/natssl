@@ -21,6 +21,7 @@ import time
 import unittest
 import urllib.request
 import hashlib
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('natssl_filters', ROOT/'ansible/filter_plugins/natssl.py')
@@ -48,15 +49,16 @@ class Filters(unittest.TestCase):
 class Deployment(unittest.TestCase):
     def test_deployment_idempotence_enrollment_delivery_and_checksum(self):
         binary = Path(os.environ['NATSSL_TEST_BINARY']).resolve()
+        version = yaml.safe_load((ROOT/'ansible/group_vars/all.yml').read_text())['natssl_release_tag']
         with tempfile.TemporaryDirectory(prefix='natssl-ansible-') as tmp:
             tmp = Path(tmp)
             api, mgmt = free_port(), free_port()
             master, client = tmp/'master', tmp/'client'
-            for path in [master, client, tmp/'bin', tmp/'release/1.0.10']:
+            for path in [master, client, tmp/'bin', tmp/'release'/version]:
                 path.mkdir(parents=True, exist_ok=True)
-            archive = tmp/'release/1.0.10/natssl-1.0.10-oss-linux-amd64.tar.gz'
+            archive = tmp/'release'/version/f'natssl-{version}-oss-linux-amd64.tar.gz'
             with tarfile.open(archive, 'w:gz') as tar:
-                tar.add(binary, arcname='natssl-1.0.10-oss-linux-amd64')
+                tar.add(binary, arcname=f'natssl-{version}-oss-linux-amd64')
             checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
             manifest = archive.parent/'SHA256SUMS.txt'
             manifest.write_text(checksum+'  '+archive.name+'\n')
@@ -126,7 +128,6 @@ class Deployment(unittest.TestCase):
                 return result.stdout
 
             play()
-            import yaml
             master_cfg = yaml.safe_load((master/'config/config.yaml').read_text())
             client_cfg = yaml.safe_load((client/'config/config.yaml').read_text())
             self.assertEqual(client_cfg['master_address'], f'127.0.0.1:{api}')

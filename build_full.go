@@ -1,5 +1,5 @@
-//go:build !clientonly
+//go:build !masteronly
 
 package main
 
-const clientOnly = false
+const masterOnly = false

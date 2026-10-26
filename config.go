@@ -39,13 +39,9 @@ type Config struct {
 
 // DefaultConfig returns a config with safe defaults.
 func DefaultConfig() *Config {
-	mode := "master"
-	if clientOnly {
-		mode = "client"
-	}
 	return &Config{
-		Mode:         mode,
-		InstallTrust: !clientOnly,
+		Mode:         "master",
+		InstallTrust: true,
 		DataDir:      "/var/lib/natssl",
 		Listen:       Listen{ACME: ":443", Mgmt: ":8443"},
 		PullInterval: time.Hour,

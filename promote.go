@@ -18,8 +18,8 @@ import (
 // state (clients, issued certs, revoked serials, blacklist) from the locally
 // stored encrypted cache.
 func RunPromote(cfg *Config, mnemonic string) error {
-	if clientOnly {
-		return fmt.Errorf("client-only build: promotion is disabled")
+	if masterOnly {
+		return fmt.Errorf("master-only build: client promotion is disabled")
 	}
 	log.Printf("=== DISASTER RECOVERY PROMOTION START ===")
 

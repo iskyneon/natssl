@@ -52,6 +52,9 @@ func loopbackSANs(subject string) (dns []string, ips []net.IP) {
 
 // RunClientIssue issues a LOOPBACK-ONLY certificate via the CSR-flow over mTLS.
 func RunClientIssue(cfg *Config, subject string, localhost bool) error {
+	if masterOnly {
+		return fmt.Errorf("master-only build: client issuance is disabled")
+	}
 	if cfg.MasterAddress == "" {
 		return fmt.Errorf("master_address is required to issue certificates")
 	}

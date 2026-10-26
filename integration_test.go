@@ -1,4 +1,4 @@
-//go:build !clientonly
+//go:build !masteronly
 
 package main
 
