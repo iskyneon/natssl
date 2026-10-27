@@ -478,9 +478,9 @@ local encrypted cache. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
-## Master-only container
+## Docker container
 
-The GHCR image runs **only master mode**, by default. Master bootstrap and
+The docker image runs **only master mode**, by default. Master bootstrap and
 administrative commands are supported; client mode, client configs and promotion
 are rejected in the compiled binary, independently of Docker arguments.
 Use the full native binaries or Ansible for clients. See
