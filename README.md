@@ -10,7 +10,6 @@ A single binary acting as a Certificate Authority (Root CA) for private
 networks, with disaster recovery via seed phrase, Certs for IPs and localhosts or internal domains — no mDNS,
 no cloud. Made by an engineer for engineers...
 
-[![release](https://img.shields.io/github/v/release/iskyneon/natssl?label=version&color=blue)](https://github.com/iskyneon/natssl/releases/latest)
 ![platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-informational)
 ![architecture](https://img.shields.io/badge/architecture-amd64%20%7C%20arm64-informational)
 
